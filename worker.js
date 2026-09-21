@@ -83,12 +83,12 @@ async function routeMessage(env, chatId, msg) {
   const lower = text.toLowerCase();
   if (lower === "/start") {
     await sendMessage(env, chatId, helpText());
-    return sendMenu(env, chatId);
+    return sendMenu(env, chatId, uid);
   }
   if (lower === "/help") return sendMessage(env, chatId, helpText());
-  if (lower.startsWith("/menu")) return sendMenu(env, chatId);
+  if (lower.startsWith("/menu")) return sendMenu(env, chatId, uid);
   if (lower.startsWith("/setup")) return setupMenuButton(env, chatId);
-  if (lower.startsWith("/tambah") || lower.startsWith("/add")) return sendMenu(env, chatId);
+  if (lower.startsWith("/tambah") || lower.startsWith("/add")) return sendMenu(env, chatId, uid);
   if (lower.startsWith("/dashboard") || lower.startsWith("/dash")) return sendDashboard(env, chatId, uid);
   if (lower.startsWith("/list") || lower.startsWith("/daftar")) return sendList(env, chatId, uid);
   if (lower.startsWith("/hari") || lower.startsWith("/tanggal")) return sendMessage(env, chatId, `📆 Sekarang: ${namaHariTanggal(Date.now())} (WIB)`);
@@ -142,7 +142,7 @@ async function handleCallback(env, cq) {
   if (!isAllowed(env, uid, chatId)) return sendMessage(env, chatId, "Maaf, bot ini privat.");
 
   try {
-    if (data === "menu") { await clearDraft(env, uid); return sendMenu(env, chatId); }
+    if (data === "menu") { await clearDraft(env, uid); return sendMenu(env, chatId, uid); }
     if (data === "dash") return sendDashboard(env, chatId, uid);
     if (data === "list") return sendList(env, chatId, uid);
     if (data === "help") return sendMessage(env, chatId, helpText(), BACK_MENU);
@@ -558,11 +558,14 @@ function parseAdd(s, j) {
   return { durasi: durasi || j.durasi, mulai, nama: s.trim(), jamMenit };
 }
 
-// Dashboard: ringkasan sekilas — apa yang perlu aksi, mepet, dan aman.
-async function sendDashboard(env, chatId, uid) {
-  const list = await getItems(env, uid);
+// Susun ringkasan dashboard dari daftar: teks + item yang perlu perhatian.
+function dashboardData(list) {
+  const nm = (it) => {
+    const j = JENIS[it.jenis] || JENIS.lainnya;
+    return `${j.emoji} ${j.label}${it.nama ? " · " + it.nama : ""}`;
+  };
   if (!list.length) {
-    return sendMessage(env, chatId, "📊 Dashboard kosong.\nBelum ada pengingat — tap jenis di /menu untuk menambah.", MENU_MAIN);
+    return { text: "📊 Belum ada pengingat.\nTap jenis di bawah untuk menambah.", perhatian: [] };
   }
   const rows = list
     .map((it) => ({ it, sisa: sisaHari(dueTs(it)), snz: snoozed(it) }))
@@ -571,11 +574,6 @@ async function sendDashboard(env, chatId, uid) {
   const mepet = rows.filter((r) => r.sisa > 0 && r.sisa <= (r.it.ingatkan || 3));
   const aman = rows.filter((r) => r.sisa > (r.it.ingatkan || 3));
   const snzCount = rows.filter((r) => r.snz).length;
-
-  const nm = (it) => {
-    const j = JENIS[it.jenis] || JENIS.lainnya;
-    return `${j.emoji} ${j.label}${it.nama ? " · " + it.nama : ""}`;
-  };
   const line = (r) => `• ${nm(r.it)} — ${labelSisa(r.sisa)}${jamStr(r.it)}${r.snz ? " 😴" : ""}`;
 
   const out = ["📊 DASHBOARD PENGINGAT", `📆 ${namaHariTanggal(Date.now())}`, ""];
@@ -588,15 +586,21 @@ async function sendDashboard(env, chatId, uid) {
   out.push("", `🟢 Aman — ${aman.length}`);
   if (aman.length) out.push(`• terdekat: ${nm(aman[0].it)} — ${labelSisa(aman[0].sisa)}`);
   out.push("", `Σ Total ${rows.length} pengingat${snzCount ? ` · 😴 ${snzCount} di-snooze` : ""}`);
+  return { text: out.join("\n"), perhatian: [...perlu, ...mepet] };
+}
 
-  // Tombol aksi cepat untuk yang perlu perhatian (maks 6).
-  const btns = [...perlu, ...mepet].slice(0, 6).map((r) => [{
+// Dashboard: ringkasan sekilas + tombol aksi cepat.
+async function sendDashboard(env, chatId, uid) {
+  const list = await getItems(env, uid);
+  const d = dashboardData(list);
+  if (!list.length) return sendMessage(env, chatId, d.text, MENU_MAIN);
+  const btns = d.perhatian.slice(0, 6).map((r) => [{
     text: `${(JENIS[r.it.jenis] || JENIS.lainnya).emoji} ${r.it.nama || (JENIS[r.it.jenis] || JENIS.lainnya).label} — ${labelSisa(r.sisa)}`,
     callback_data: `item:${r.it.id}`,
   }]);
   btns.push([{ text: "📋 Daftar lengkap", callback_data: "list" }, { text: "🔄 Refresh", callback_data: "dash" }]);
-  btns.push([BACK_BTN]);
-  return sendMessage(env, chatId, out.join("\n"), kb(btns));
+  btns.push([{ text: "➕ Tambah / menu", callback_data: "menu" }]);
+  return sendMessage(env, chatId, d.text, kb(btns));
 }
 
 async function sendList(env, chatId, uid) {
@@ -1055,7 +1059,12 @@ const MENU_MAIN = {
   },
 };
 
-async function sendMenu(env, chatId) {
+async function sendMenu(env, chatId, uid) {
+  if (uid != null) {
+    const list = await getItems(env, uid);
+    const d = dashboardData(list);
+    return sendMessage(env, chatId, d.text + "\n\n— — —\nTambah pengingat baru atau kelola:", MENU_MAIN);
+  }
   return sendMessage(env, chatId, "🔔 Menu Pengingat\nTambah pengingat baru atau lihat daftar:", MENU_MAIN);
 }
 
