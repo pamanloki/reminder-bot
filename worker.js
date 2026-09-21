@@ -143,25 +143,31 @@ async function addReminder(env, chatId, uid, jenis, argStr) {
     id: Date.now(),
     jenis,
     nama: p.nama,
-    mulai: p.mulai,
-    durasi: p.durasi,
     ingatkan: j.ingatkan,
   };
+  if (p.hariBulan) {
+    item.hariBulan = p.hariBulan; // pengingat bulanan tanggal tetap
+  } else {
+    item.mulai = p.mulai;
+    item.durasi = p.durasi;
+  }
   const list = await getItems(env, uid);
   list.push(item);
   await saveItems(env, uid, list);
 
-  const habis = item.mulai + item.durasi * DAY;
-  const sisa = sisaHari(habis);
+  const due = dueTs(item);
+  const sisa = sisaHari(due);
+  const barisJadwal = item.hariBulan
+    ? `🔁 Tiap tanggal ${item.hariBulan} tiap bulan`
+    : `📅 Mulai: ${namaHariTanggal(item.mulai)}\n⏳ ${j.kata}: ${item.durasi} hari`;
   return sendMessage(
     env,
     chatId,
     [
       `✅ Pengingat dibuat:`,
       `${j.emoji} ${j.label}${item.nama ? " — " + item.nama : ""}`,
-      `📅 Mulai: ${namaHariTanggal(item.mulai)}`,
-      `⏳ ${j.kata}: ${item.durasi} hari`,
-      `🔔 ${j.kata === "isi ulang" ? "Ingat isi ulang" : "Habis"}: ${namaHariTanggal(habis)} (${labelSisa(sisa)})`,
+      barisJadwal,
+      `🔔 Berikutnya: ${namaHariTanggal(due)} (${labelSisa(sisa)})`,
       "",
       `Aku ingatkan otomatis mulai H-${item.ingatkan}.`,
     ].join("\n"),
@@ -169,11 +175,30 @@ async function addReminder(env, chatId, uid, jenis, argStr) {
   );
 }
 
-// Parse "30 15-9 IM3" -> { durasi, mulai(ts), nama }
+// Jatuh tempo/hari-H sebuah pengingat (dukung bulanan tanggal tetap & durasi).
+function dueTs(it) {
+  if (it.hariBulan) return nextMonthlyTs(it.hariBulan);
+  return it.mulai + it.durasi * DAY;
+}
+
+// Parse input:
+//   "tiap 25 100rb"   -> bulanan tanggal 25, nama 100rb
+//   "30 15-9 IM3"     -> durasi 30, mulai 15-9, nama IM3
 function parseAdd(s, j) {
   s = (s || "").trim();
+
+  // Bulanan tanggal tetap: "tiap 25" / "setiap tgl 25" / "tiap tanggal 25"
+  const bl = s.match(/\b(?:tiap|setiap)\s*(?:tgl|tanggal)?\s*(\d{1,2})\b/i);
+  if (bl) {
+    const d = +bl[1];
+    if (d >= 1 && d <= 31) {
+      const nama = (s.slice(0, bl.index) + s.slice(bl.index + bl[0].length)).replace(/\s+/g, " ").trim();
+      return { hariBulan: d, nama };
+    }
+  }
+
+  // tanggal mulai (dd-mm[-yyyy])
   let mulai = todayTs();
-  // tanggal (dd-mm[-yyyy])
   const dm = s.match(/(\d{1,2})[-/ ](\d{1,2})(?:[-/ ](\d{2,4}))?/);
   if (dm) {
     const d = +dm[1], mo = +dm[2];
@@ -191,15 +216,14 @@ function parseAdd(s, j) {
     durasi = +dur[1];
     s = (s.slice(0, dur.index) + s.slice(dur.index + dur[0].length)).replace(/\s+/g, " ").trim();
   }
-  const nama = s.trim();
-  return { durasi: durasi || j.durasi, mulai, nama };
+  return { durasi: durasi || j.durasi, mulai, nama: s.trim() };
 }
 
 async function sendList(env, chatId, uid) {
   const list = await getItems(env, uid);
   if (!list.length) return sendMessage(env, chatId, "Belum ada pengingat. Tekan /menu untuk menambah.", BACK_MENU);
   // urutkan dari yang paling mepet
-  const withSisa = list.map((it) => ({ it, sisa: sisaHari(it.mulai + it.durasi * DAY) })).sort((a, b) => a.sisa - b.sisa);
+  const withSisa = list.map((it) => ({ it, sisa: sisaHari(dueTs(it)) })).sort((a, b) => a.sisa - b.sisa);
   const rows = [];
   const lines = ["📋 Daftar pengingat:", ""];
   for (const { it, sisa } of withSisa) {
@@ -216,21 +240,24 @@ async function sendItem(env, chatId, uid, id) {
   const it = list.find((x) => x.id === id);
   if (!it) return sendMessage(env, chatId, "Pengingat tidak ditemukan.", BACK_MENU);
   const j = JENIS[it.jenis] || JENIS.lainnya;
-  const habis = it.mulai + it.durasi * DAY;
-  const sisa = sisaHari(habis);
+  const due = dueTs(it);
+  const sisa = sisaHari(due);
+  const jadwal = it.hariBulan
+    ? `🔁 Tiap tanggal ${it.hariBulan} tiap bulan`
+    : `📅 Mulai: ${namaHariTanggal(it.mulai)}\n⏳ ${j.kata}: ${it.durasi} hari`;
   const info = [
     `${j.emoji} ${j.label}${it.nama ? " — " + it.nama : ""}`,
-    `📅 Mulai: ${namaHariTanggal(it.mulai)}`,
-    `⏳ ${j.kata}: ${it.durasi} hari`,
-    `🔔 ${j.kata === "isi ulang" ? "Isi ulang" : "Habis"}: ${namaHariTanggal(habis)} (${labelSisa(sisa)})`,
+    jadwal,
+    `🔔 Berikutnya: ${namaHariTanggal(due)} (${labelSisa(sisa)})`,
   ].join("\n");
-  const rows = [
-    [
-      { text: "✅ Sudah beli / perpanjang", callback_data: `done:${it.id}` },
-      { text: "🗑️ Hapus", callback_data: `del:${it.id}` },
-    ],
-    [{ text: "🔙 Daftar", callback_data: "list" }, BACK_BTN],
-  ];
+  // Pengingat bulanan otomatis berulang -> tak perlu tombol perpanjang.
+  const btnBaris = it.hariBulan
+    ? [{ text: "🗑️ Hapus", callback_data: `del:${it.id}` }]
+    : [
+        { text: "✅ Sudah beli / perpanjang", callback_data: `done:${it.id}` },
+        { text: "🗑️ Hapus", callback_data: `del:${it.id}` },
+      ];
+  const rows = [btnBaris, [{ text: "🔙 Daftar", callback_data: "list" }, BACK_BTN]];
   return sendMessage(env, chatId, info, { reply_markup: { inline_keyboard: rows } });
 }
 
@@ -239,11 +266,14 @@ async function perpanjang(env, chatId, uid, id) {
   const list = await getItems(env, uid);
   const it = list.find((x) => x.id === id);
   if (!it) return sendMessage(env, chatId, "Pengingat tidak ditemukan.", BACK_MENU);
+  const j = JENIS[it.jenis] || JENIS.lainnya;
+  if (it.hariBulan) {
+    return sendMessage(env, chatId, `${j.emoji} ${j.label} otomatis berulang tiap tanggal ${it.hariBulan}. Aman, aku ingatkan lagi bulan depan. 👍`, BACK_MENU);
+  }
   it.mulai = todayTs();
   await saveItems(env, uid, list);
-  const j = JENIS[it.jenis] || JENIS.lainnya;
-  const habis = it.mulai + it.durasi * DAY;
-  return sendMessage(env, chatId, `✅ Diperbarui. ${j.emoji} ${j.label} berlaku sampai ${namaHariTanggal(habis)}.`, BACK_MENU);
+  const due = dueTs(it);
+  return sendMessage(env, chatId, `✅ Diperbarui. ${j.emoji} ${j.label} berlaku sampai ${namaHariTanggal(due)}.`, BACK_MENU);
 }
 
 async function hapusReminder(env, chatId, uid, id) {
@@ -271,7 +301,7 @@ async function runScheduled(env) {
         const list = JSON.parse((await env.REMINDERS.get(k.name)) || "[]");
         const due = [];
         for (const it of list) {
-          const sisa = sisaHari(it.mulai + it.durasi * DAY);
+          const sisa = sisaHari(dueTs(it));
           if (sisa <= it.ingatkan) due.push({ it, sisa });
         }
         if (!due.length) continue;
@@ -289,7 +319,7 @@ function buildNotif(due) {
   const lines = ["🔔 PENGINGAT", ""];
   for (const { it, sisa } of due) {
     const j = JENIS[it.jenis] || JENIS.lainnya;
-    const habis = it.mulai + it.durasi * DAY;
+    const habis = dueTs(it);
     lines.push(`${statusIcon(sisa, it.ingatkan)} ${j.emoji} ${j.label}${it.nama ? " — " + it.nama : ""}`);
     lines.push(`   ${j.kata === "isi ulang" ? "Waktunya isi ulang" : "Habis"}: ${namaHariTanggal(habis)} — ${labelSisa(sisa)}`);
     lines.push(`   👉 ${saran(j, sisa)}`);
@@ -313,6 +343,21 @@ function saran(j, sisa) {
 function todayTs() {
   const p = wibParts(Date.now());
   return Date.UTC(p.y, p.m - 1, p.d, 12) - WIB_OFFSET_MS; // tengah hari WIB hari ini
+}
+function daysInMonth(y, m) {
+  return new Date(Date.UTC(y, m, 0)).getUTCDate(); // m: 1-12
+}
+// Tanggal berikutnya dengan hari-bulan = d, pada/sesudah hari ini (WIB).
+function nextMonthlyTs(d) {
+  const t = wibParts(Date.now());
+  let y = t.y, m = t.m;
+  const dayThis = Math.min(d, daysInMonth(y, m));
+  if (Date.UTC(y, m - 1, dayThis) >= Date.UTC(t.y, t.m - 1, t.d)) {
+    return Date.UTC(y, m - 1, dayThis, 12) - WIB_OFFSET_MS;
+  }
+  m++; if (m > 12) { m = 1; y++; }
+  const dayNext = Math.min(d, daysInMonth(y, m));
+  return Date.UTC(y, m - 1, dayNext, 12) - WIB_OFFSET_MS;
 }
 function sisaHari(habisTs) {
   const h = wibParts(habisTs);
@@ -378,20 +423,22 @@ async function sendMenu(env, chatId) {
 function addPromptText(jenis) {
   const j = JENIS[jenis] || JENIS.lainnya;
   const contoh = {
-    listrik: "30 150rb            → ingat isi ulang tiap 30 hari\n30 20-9            → mulai dari tanggal 20-9",
+    listrik: "tiap 25 100rb      → tiap tanggal 25 tiap bulan (nama 100rb)\n30                 → ingat tiap 30 hari sejak hari ini",
     pulsa: "45                 → masa aktif 45 hari, mulai hari ini\n30 20-9 XL         → beli 20-9, nama XL",
-    paket: "30 20-9 IM3        → paket 30 hari, beli 20-9, nama IM3\n28                 → 28 hari mulai hari ini",
-    lainnya: "30 20-9 nama       → jatuh tempo 30 hari sejak 20-9",
+    paket: "30 20-9 IM3        → paket 30 hari, beli 20-9, nama IM3\ntiap 1             → tiap tanggal 1 tiap bulan",
+    lainnya: "tiap 10            → tiap tanggal 10 tiap bulan\n30 20-9 nama       → jatuh tempo 30 hari sejak 20-9",
   };
   return [
     `${j.emoji} ${j.label}`,
     "",
-    "Ketik: masa_aktif_hari [tgl] [nama]",
+    "Dua cara:",
+    "• Bulanan tetap:  tiap <tgl>   → mis. tiap 25",
+    "• Masa aktif:     <hari> [tgl] → mis. 30 20-9",
     "",
     "Contoh:",
     contoh[jenis] || contoh.lainnya,
     "",
-    `(tanpa tanggal = mulai hari ini · default ${j.durasi} hari · ingat H-${j.ingatkan})`,
+    `(default ${j.durasi} hari · ingat mulai H-${j.ingatkan})`,
   ].join("\n");
 }
 
@@ -403,18 +450,20 @@ function helpText() {
     "━ CARA TAMBAH ━",
     "Paling gampang: /menu → tap jenisnya → ikuti contohnya.",
     "",
-    "Atau ketik langsung:",
-    "  <jenis> <masa_aktif_hari> [tgl] [nama]",
+    "Atau ketik langsung. Dua cara:",
+    "",
+    "1) Bulanan tanggal tetap:",
+    "   <jenis> tiap <tgl> [nama]",
+    "   • listrik tiap 25 100rb → tiap tanggal 25, tiap bulan",
+    "   • paket tiap 1          → tiap tanggal 1",
+    "",
+    "2) Masa aktif (N hari):",
+    "   <jenis> <hari> [tgl] [nama]",
+    "   • paket 30 15-9 IM3     → 30 hari, beli 15/9, nama IM3",
+    "   • pulsa 45              → 45 hari, mulai hari ini",
     "",
     "jenis: listrik / pulsa / paket / lainnya",
     "  (alias: token, pln, kuota, internet, data)",
-    "",
-    "Contoh:",
-    "• paket 30 15-9 IM3   → paket 30 hari, beli 15/9, nama IM3",
-    "• pulsa 45            → masa aktif 45 hari, mulai hari ini",
-    "• listrik 30          → ingat isi ulang token tiap 30 hari",
-    "",
-    "Tanggal opsional (DD-MM / DD-MM-YYYY). Tanpa tanggal = mulai hari ini.",
     "",
     "━ NOTIFIKASI ━",
     "Aku kirim pengingat otomatis menjelang habis:",
