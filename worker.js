@@ -111,6 +111,11 @@ async function routeMessage(env, chatId, msg) {
     await clearMode(env, uid);
     return beliTanggalTyped(env, chatId, uid, Number(mode.slice(4)), text);
   }
+  if (mode && mode.startsWith("edit:")) {
+    await clearMode(env, uid);
+    const [, id, field] = mode.split(":");
+    return applyEdit(env, chatId, uid, Number(id), field, text);
+  }
 
   return sendMessage(env, chatId, "Belum kebaca. Tekan /menu untuk pakai tombol,\natau ketik cepat: 'paket 30 15-9 IM3'.", BACK_MENU);
 }
@@ -131,6 +136,8 @@ async function handleCallback(env, cq) {
     if (data[0] === "w") return handleWizard(env, chatId, uid, data);
     if (data.startsWith("done:")) return sudahBeli(env, chatId, uid, Number(data.slice(5)));
     if (data.startsWith("bt:")) { const [, id, when] = data.split(":"); return beliTanggal(env, chatId, uid, Number(id), when); }
+    if (data.startsWith("edit:")) return sendEditMenu(env, chatId, uid, Number(data.slice(5)));
+    if (data.startsWith("ed:")) { const [, id, field] = data.split(":"); return editField(env, chatId, uid, Number(id), field); }
     if (data.startsWith("del:")) return hapusReminder(env, chatId, uid, Number(data.slice(4)));
     if (data.startsWith("item:")) return sendItem(env, chatId, uid, Number(data.slice(5)));
   } catch (e) {
@@ -575,8 +582,89 @@ async function sendItem(env, chatId, uid, id) {
         { text: "✅ Sudah beli / isi ulang", callback_data: `done:${it.id}` },
         { text: "🗑️ Hapus", callback_data: `del:${it.id}` },
       ];
-  const rows = [btnBaris, [{ text: "🔙 Daftar", callback_data: "list" }, BACK_BTN]];
+  const rows = [
+    btnBaris,
+    [{ text: "✏️ Edit", callback_data: `edit:${it.id}` }],
+    [{ text: "🔙 Daftar", callback_data: "list" }, BACK_BTN],
+  ];
   return sendMessage(env, chatId, info, { reply_markup: { inline_keyboard: rows } });
+}
+
+// Menu edit: pilih bagian yang mau diubah.
+async function sendEditMenu(env, chatId, uid, id) {
+  const list = await getItems(env, uid);
+  const it = list.find((x) => x.id === id);
+  if (!it) return sendMessage(env, chatId, "Pengingat tidak ditemukan.", BACK_MENU);
+  const j = JENIS[it.jenis] || JENIS.lainnya;
+  const rows = [[{ text: "🏷️ Nama / nominal", callback_data: `ed:${it.id}:nama` }]];
+  if (it.hariBulan) {
+    rows.push([{ text: "🔁 Tanggal bulanan", callback_data: `ed:${it.id}:tgl` }]);
+  } else {
+    rows.push([{ text: "⏳ Masa aktif (hari)", callback_data: `ed:${it.id}:durasi` }]);
+    rows.push([{ text: "📅 Tanggal beli/mulai", callback_data: `ed:${it.id}:mulai` }]);
+  }
+  rows.push([{ text: "🕐 Jam", callback_data: `ed:${it.id}:jam` }]);
+  rows.push([{ text: "🔔 Ingatkan H-berapa", callback_data: `ed:${it.id}:ingatkan` }]);
+  rows.push([{ text: "🔙 Kembali", callback_data: `item:${it.id}` }]);
+  return sendMessage(env, chatId, `✏️ Edit ${j.emoji} ${j.label}${it.nama ? " — " + it.nama : ""}\nPilih yang mau diubah:`, kb(rows));
+}
+
+// Tekan salah satu field edit -> minta input teks.
+async function editField(env, chatId, uid, id, field) {
+  const prompts = {
+    nama: "Ketik nama/label baru (mis. Telkomsel · Nomerku · 50rb):",
+    durasi: "Ketik masa aktif baru (jumlah hari, mis. 30):",
+    tgl: "Ketik tanggal bulanan baru (1-31):",
+    mulai: "Ketik tanggal beli/mulai (mis. 20-9):",
+    jam: "Ketik jam (HH:MM, mis. 14:30) — atau ketik 'hapus' untuk tanpa jam:",
+    ingatkan: "Ingatkan berapa hari sebelumnya? (mis. 3):",
+  };
+  const msg = prompts[field];
+  if (!msg) return sendMessage(env, chatId, "Field tidak dikenal.", BACK_MENU);
+  await setMode(env, uid, `edit:${id}:${field}`);
+  return sendMessage(env, chatId, msg, kb([[{ text: "🔙 Batal", callback_data: `item:${id}` }]]));
+}
+
+// Terapkan hasil edit lalu tampilkan lagi detail item.
+async function applyEdit(env, chatId, uid, id, field, text) {
+  const list = await getItems(env, uid);
+  const it = list.find((x) => x.id === id);
+  if (!it) return sendMessage(env, chatId, "Pengingat tidak ditemukan.", BACK_MENU);
+  const t = (text || "").trim();
+  const reprompt = (m) => setMode(env, uid, `edit:${id}:${field}`).then(() =>
+    sendMessage(env, chatId, m, kb([[{ text: "🔙 Batal", callback_data: `item:${id}` }]])));
+  if (field === "nama") {
+    it.nama = t;
+  } else if (field === "durasi") {
+    const n = parseInt(t, 10);
+    if (!n || n < 1) return reprompt("Angka tidak valid. Ketik jumlah hari (mis. 30):");
+    it.durasi = n; delete it.hariBulan; delete it.skipUntil;
+    if (it.mulai == null) it.mulai = todayTs();
+  } else if (field === "tgl") {
+    const n = parseInt(t, 10);
+    if (!n || n < 1 || n > 31) return reprompt("Tanggal tidak valid (1-31). Ketik lagi:");
+    it.hariBulan = n; delete it.durasi; delete it.mulai; delete it.skipUntil;
+  } else if (field === "mulai") {
+    const ts = parseTanggal(t);
+    if (ts == null) return reprompt("Tanggal tidak valid. Contoh: 20-9 (20 September).");
+    it.mulai = ts; delete it.skipUntil;
+  } else if (field === "jam") {
+    if (/^(hapus|tanpa|none|-)$/i.test(t)) { delete it.jamMenit; }
+    else {
+      const m = t.match(/(\d{1,2})[:.](\d{2})/);
+      if (!m || +m[1] > 23 || +m[2] > 59) return reprompt("Jam tidak valid. Contoh: 14:30 (atau 'hapus').");
+      it.jamMenit = +m[1] * 60 + +m[2];
+    }
+  } else if (field === "ingatkan") {
+    const n = parseInt(t, 10);
+    if (isNaN(n) || n < 0 || n > 60) return reprompt("Angka tidak valid (0-60). Ketik lagi:");
+    it.ingatkan = n;
+  } else {
+    return sendMessage(env, chatId, "Field tidak dikenal.", BACK_MENU);
+  }
+  await saveItems(env, uid, list);
+  await sendMessage(env, chatId, "✅ Tersimpan.");
+  return sendItem(env, chatId, uid, id);
 }
 
 // Tombol "Sudah beli". Bulanan tanggal tetap -> lompat sebulan.
@@ -835,6 +923,9 @@ function helpText() {
     "  • Pulsa/paket/listrik: pilih 'Hari ini' atau ketik tgl beli",
     "    → masa aktif dihitung dari tanggal itu.",
     "  • Bulanan tanggal tetap: otomatis lewati ke bulan depan.",
+    "",
+    "✏️ EDIT: /list → tap item → ✏️ Edit → pilih bagian",
+    "   (nama/nominal, masa aktif/tanggal, tgl beli, jam, H-ingatkan).",
     "",
     "━ NOTIFIKASI ━",
     "Pengingat otomatis menjelang habis:",
