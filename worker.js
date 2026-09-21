@@ -373,7 +373,7 @@ async function addReminder(env, chatId, uid, jenis, argStr) {
 
 // Jatuh tempo/hari-H sebuah pengingat (dukung bulanan tetap, durasi, & jam).
 function dueTs(it) {
-  const base = it.hariBulan ? nextMonthlyTs(it.hariBulan) : it.mulai + it.durasi * DAY;
+  const base = it.hariBulan ? nextMonthlyTs(it.hariBulan, it.skipUntil) : it.mulai + it.durasi * DAY;
   if (it.jamMenit == null) return base;
   const p = wibParts(base);
   return Date.UTC(p.y, p.m - 1, p.d, Math.floor(it.jamMenit / 60), it.jamMenit % 60) - WIB_OFFSET_MS;
@@ -467,9 +467,11 @@ async function sendItem(env, chatId, uid, id) {
     jadwal,
     `🔔 Berikutnya: ${namaHariTanggal(due)}${jamStr(it)} (${labelSisa(sisa)})`,
   ].join("\n");
-  // Pengingat bulanan otomatis berulang -> tak perlu tombol perpanjang.
   const btnBaris = it.hariBulan
-    ? [{ text: "🗑️ Hapus", callback_data: `del:${it.id}` }]
+    ? [
+        { text: "✅ Sudah beli bulan ini", callback_data: `done:${it.id}` },
+        { text: "🗑️ Hapus", callback_data: `del:${it.id}` },
+      ]
     : [
         { text: "✅ Sudah beli / perpanjang", callback_data: `done:${it.id}` },
         { text: "🗑️ Hapus", callback_data: `del:${it.id}` },
@@ -485,7 +487,16 @@ async function perpanjang(env, chatId, uid, id) {
   if (!it) return sendMessage(env, chatId, "Pengingat tidak ditemukan.", BACK_MENU);
   const j = JENIS[it.jenis] || JENIS.lainnya;
   if (it.hariBulan) {
-    return sendMessage(env, chatId, `${j.emoji} ${j.label} otomatis berulang tiap tanggal ${it.hariBulan}. Aman, aku ingatkan lagi bulan depan. 👍`, BACK_MENU);
+    // Lewati tanggal terdekat -> pengingat lompat ke bulan berikutnya.
+    it.skipUntil = dueTs(it);
+    await saveItems(env, uid, list);
+    const next = dueTs(it);
+    return sendMessage(
+      env,
+      chatId,
+      `👍 Oke, tanggal ${it.hariBulan} bulan ini aku lewati.\n🔔 Pengingat berikutnya: ${namaHariTanggal(next)}${jamStr(it)}.`,
+      BACK_MENU,
+    );
   }
   it.mulai = todayTs();
   await saveItems(env, uid, list);
@@ -565,11 +576,21 @@ function daysInMonth(y, m) {
   return new Date(Date.UTC(y, m, 0)).getUTCDate(); // m: 1-12
 }
 // Tanggal berikutnya dengan hari-bulan = d, pada/sesudah hari ini (WIB).
-function nextMonthlyTs(d) {
+// `after` (opsional): lewati semua tanggal sampai dengan hari itu — dipakai saat
+// user menekan "sudah beli bulan ini" agar pengingat lompat ke bulan berikutnya.
+function nextMonthlyTs(d, after) {
   const t = wibParts(Date.now());
-  let y = t.y, m = t.m;
+  // Titik acuan minimal = hari ini; kalau `after` lebih jauh, mulai dari sehari sesudahnya.
+  let refUTC = Date.UTC(t.y, t.m - 1, t.d);
+  if (after) {
+    const a = wibParts(after);
+    const aNext = Date.UTC(a.y, a.m - 1, a.d) + DAY;
+    if (aNext > refUTC) refUTC = aNext;
+  }
+  const ref = wibParts(refUTC);
+  let y = ref.y, m = ref.m;
   const dayThis = Math.min(d, daysInMonth(y, m));
-  if (Date.UTC(y, m - 1, dayThis) >= Date.UTC(t.y, t.m - 1, t.d)) {
+  if (Date.UTC(y, m - 1, dayThis) >= refUTC) {
     return Date.UTC(y, m - 1, dayThis, 12) - WIB_OFFSET_MS;
   }
   m++; if (m > 12) { m = 1; y++; }
