@@ -151,6 +151,7 @@ async function addReminder(env, chatId, uid, jenis, argStr) {
     item.mulai = p.mulai;
     item.durasi = p.durasi;
   }
+  if (p.jamMenit != null) item.jamMenit = p.jamMenit; // jam habis (opsional)
   const list = await getItems(env, uid);
   list.push(item);
   await saveItems(env, uid, list);
@@ -167,7 +168,7 @@ async function addReminder(env, chatId, uid, jenis, argStr) {
       `✅ Pengingat dibuat:`,
       `${j.emoji} ${j.label}${item.nama ? " — " + item.nama : ""}`,
       barisJadwal,
-      `🔔 Berikutnya: ${namaHariTanggal(due)} (${labelSisa(sisa)})`,
+      `🔔 Berikutnya: ${namaHariTanggal(due)}${jamStr(item)} (${labelSisa(sisa)})`,
       "",
       `Aku ingatkan otomatis mulai H-${item.ingatkan}.`,
     ].join("\n"),
@@ -175,10 +176,20 @@ async function addReminder(env, chatId, uid, jenis, argStr) {
   );
 }
 
-// Jatuh tempo/hari-H sebuah pengingat (dukung bulanan tanggal tetap & durasi).
+// Jatuh tempo/hari-H sebuah pengingat (dukung bulanan tetap, durasi, & jam).
 function dueTs(it) {
-  if (it.hariBulan) return nextMonthlyTs(it.hariBulan);
-  return it.mulai + it.durasi * DAY;
+  const base = it.hariBulan ? nextMonthlyTs(it.hariBulan) : it.mulai + it.durasi * DAY;
+  if (it.jamMenit == null) return base;
+  const p = wibParts(base);
+  return Date.UTC(p.y, p.m - 1, p.d, Math.floor(it.jamMenit / 60), it.jamMenit % 60) - WIB_OFFSET_MS;
+}
+function pad(n) {
+  return String(n).padStart(2, "0");
+}
+// " jam 14:30" bila item punya jam, kalau tidak string kosong.
+function jamStr(it) {
+  if (it == null || it.jamMenit == null) return "";
+  return ` jam ${pad(Math.floor(it.jamMenit / 60))}:${pad(it.jamMenit % 60)}`;
 }
 
 // Parse input:
@@ -187,19 +198,30 @@ function dueTs(it) {
 function parseAdd(s, j) {
   s = (s || "").trim();
 
+  // Jam (HH:MM) — dibaca duluan supaya tidak tertukar durasi. Contoh: "jam 14:30".
+  let jamMenit = null;
+  const jm = s.match(/(?:jam\s*)?\b(\d{1,2})[:.](\d{2})\b/);
+  if (jm) {
+    const hh = +jm[1], mm = +jm[2];
+    if (hh < 24 && mm < 60) {
+      jamMenit = hh * 60 + mm;
+      s = (s.slice(0, jm.index) + s.slice(jm.index + jm[0].length)).replace(/\s+/g, " ").trim();
+    }
+  }
+
   // Bulanan tanggal tetap: "tiap 25" / "setiap tgl 25" / "tiap tanggal 25"
   const bl = s.match(/\b(?:tiap|setiap)\s*(?:tgl|tanggal)?\s*(\d{1,2})\b/i);
   if (bl) {
     const d = +bl[1];
     if (d >= 1 && d <= 31) {
       const nama = (s.slice(0, bl.index) + s.slice(bl.index + bl[0].length)).replace(/\s+/g, " ").trim();
-      return { hariBulan: d, nama };
+      return { hariBulan: d, nama, jamMenit };
     }
   }
 
-  // tanggal mulai (dd-mm[-yyyy])
+  // tanggal mulai (dd-mm[-yyyy]) — pakai '-' atau '/' (bukan spasi, biar tak tertukar durasi)
   let mulai = todayTs();
-  const dm = s.match(/(\d{1,2})[-/ ](\d{1,2})(?:[-/ ](\d{2,4}))?/);
+  const dm = s.match(/\b(\d{1,2})[-/](\d{1,2})(?:[-/](\d{2,4}))?\b/);
   if (dm) {
     const d = +dm[1], mo = +dm[2];
     let y = dm[3] ? +dm[3] : wibParts(Date.now()).y;
@@ -216,7 +238,7 @@ function parseAdd(s, j) {
     durasi = +dur[1];
     s = (s.slice(0, dur.index) + s.slice(dur.index + dur[0].length)).replace(/\s+/g, " ").trim();
   }
-  return { durasi: durasi || j.durasi, mulai, nama: s.trim() };
+  return { durasi: durasi || j.durasi, mulai, nama: s.trim(), jamMenit };
 }
 
 async function sendList(env, chatId, uid) {
@@ -248,7 +270,7 @@ async function sendItem(env, chatId, uid, id) {
   const info = [
     `${j.emoji} ${j.label}${it.nama ? " — " + it.nama : ""}`,
     jadwal,
-    `🔔 Berikutnya: ${namaHariTanggal(due)} (${labelSisa(sisa)})`,
+    `🔔 Berikutnya: ${namaHariTanggal(due)}${jamStr(it)} (${labelSisa(sisa)})`,
   ].join("\n");
   // Pengingat bulanan otomatis berulang -> tak perlu tombol perpanjang.
   const btnBaris = it.hariBulan
@@ -321,7 +343,7 @@ function buildNotif(due) {
     const j = JENIS[it.jenis] || JENIS.lainnya;
     const habis = dueTs(it);
     lines.push(`${statusIcon(sisa, it.ingatkan)} ${j.emoji} ${j.label}${it.nama ? " — " + it.nama : ""}`);
-    lines.push(`   ${j.kata === "isi ulang" ? "Waktunya isi ulang" : "Habis"}: ${namaHariTanggal(habis)} — ${labelSisa(sisa)}`);
+    lines.push(`   ${j.kata === "isi ulang" ? "Waktunya isi ulang" : "Habis"}: ${namaHariTanggal(habis)}${jamStr(it)} — ${labelSisa(sisa)}`);
     lines.push(`   👉 ${saran(j, sisa)}`);
     lines.push("");
   }
@@ -425,7 +447,7 @@ function addPromptText(jenis) {
   const contoh = {
     listrik: "tiap 25 100rb      → tiap tanggal 25 tiap bulan (nama 100rb)\n30                 → ingat tiap 30 hari sejak hari ini",
     pulsa: "45                 → masa aktif 45 hari, mulai hari ini\n30 20-9 XL         → beli 20-9, nama XL",
-    paket: "30 20-9 IM3        → paket 30 hari, beli 20-9, nama IM3\ntiap 1             → tiap tanggal 1 tiap bulan",
+    paket: "30 20-9 IM3        → paket 30 hari, beli 20-9, nama IM3\n30 20-9 jam 14:30  → habis jam 14:30 (paket sering habis di jam tertentu)",
     lainnya: "tiap 10            → tiap tanggal 10 tiap bulan\n30 20-9 nama       → jatuh tempo 30 hari sejak 20-9",
   };
   return [
@@ -464,6 +486,10 @@ function helpText() {
     "",
     "jenis: listrik / pulsa / paket / lainnya",
     "  (alias: token, pln, kuota, internet, data)",
+    "",
+    "Opsional jam habis (bagus buat paket): tambah 'jam HH:MM'",
+    "  • paket 30 20-9 jam 23:59",
+    "  • paket tiap 25 jam 14:30",
     "",
     "━ NOTIFIKASI ━",
     "Aku kirim pengingat otomatis menjelang habis:",
