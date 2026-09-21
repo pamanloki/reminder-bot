@@ -173,6 +173,25 @@ async function addCustomOp(env, uid, name) {
   await env.REMINDERS.put(`ops:${uid}`, JSON.stringify(l.slice(0, 30)));
 }
 
+// Label "atas nama siapa" (tersimpan, muncul lagi sebagai tombol).
+async function getCustomLabels(env, uid) {
+  const r = await env.REMINDERS.get(`labels:${uid}`);
+  return r ? JSON.parse(r) : [];
+}
+async function addCustomLabel(env, uid, name) {
+  name = name.trim().slice(0, 20);
+  if (!name) return;
+  const l = await getCustomLabels(env, uid);
+  if (l.some((o) => o.toLowerCase() === name.toLowerCase())) return;
+  l.push(name);
+  await env.REMINDERS.put(`labels:${uid}`, JSON.stringify(l.slice(0, 30)));
+}
+// Gabungkan operator + pemilik → satu label tampilan.
+function joinNama(op, owner) {
+  if (op && owner) return `${op} · ${owner}`;
+  return op || owner || "";
+}
+
 const CANCEL_ROW = [{ text: "✖️ Batal", callback_data: "menu" }];
 function kb(rows) { return { reply_markup: { inline_keyboard: rows } }; }
 function chunk(arr, n) { const out = []; for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n)); return out; }
@@ -185,8 +204,8 @@ async function handleWizard(env, chatId, uid, data) {
   if (step === "jenis") {
     await saveDraft(env, uid, { jenis: val });
     if (val === "pulsa" || val === "paket") return wStepOperator(env, chatId, uid);
-    // Token listrik tak punya "masa aktif" — habisnya karena kepakai. Langsung pilih tanggal bulanan.
-    if (val === "listrik") return wStepTanggal(env, chatId);
+    // Token listrik tak punya "masa aktif" — habisnya karena kepakai. Tanya pemilik dulu (rumah/kontrakan).
+    if (val === "listrik") return wStepPemilik(env, chatId, uid);
     return wStepSchedule(env, chatId);
   }
 
@@ -195,7 +214,11 @@ async function handleWizard(env, chatId, uid, data) {
 
   if (step === "op") {
     if (val === "type") { await setMode(env, uid, "w_op"); return sendMessage(env, chatId, "Ketik nama operator:", kb([CANCEL_ROW])); }
-    d.nama = val; await saveDraft(env, uid, d); return wStepSchedule(env, chatId);
+    d.op = val; await saveDraft(env, uid, d); return wStepPemilik(env, chatId, uid);
+  }
+  if (step === "own") {
+    if (val === "type") { await setMode(env, uid, "w_own"); return sendMessage(env, chatId, "Ketik atas nama siapa (mis. Nomerku, Pacarku):", kb([CANCEL_ROW])); }
+    return wSetPemilik(env, chatId, uid, d, val === "skip" ? "" : val);
   }
   if (step === "sched") {
     return val === "tanggal" ? wStepTanggal(env, chatId) : wStepDurasi(env, chatId);
@@ -221,7 +244,8 @@ async function handleWizard(env, chatId, uid, data) {
 async function wizardTyped(env, chatId, uid, field, text) {
   const d = await getDraft(env, uid);
   if (!d) return sendMessage(env, chatId, "Sesi kadaluarsa. Mulai lagi dari /menu.", BACK_MENU);
-  if (field === "op") { const op = text.trim(); d.nama = op; await addCustomOp(env, uid, op); await saveDraft(env, uid, d); return wStepSchedule(env, chatId); }
+  if (field === "op") { const op = text.trim(); d.op = op; await addCustomOp(env, uid, op); await saveDraft(env, uid, d); return wStepPemilik(env, chatId, uid); }
+  if (field === "own") { return wSetPemilik(env, chatId, uid, d, text.trim()); }
   if (field === "dur") {
     const n = parseInt(text, 10);
     if (!n || n < 1) return sendMessage(env, chatId, "Angka tidak valid. Ketik jumlah hari (mis. 28):", kb([CANCEL_ROW]));
@@ -242,6 +266,23 @@ async function wStepOperator(env, chatId, uid) {
   rows.push([{ text: "✏️ Operator lain (ketik)", callback_data: "w:op:type" }]);
   rows.push(CANCEL_ROW);
   return sendMessage(env, chatId, "📱 Pilih operator:", kb(rows));
+}
+// Langkah "atas nama siapa" (opsional). Untuk listrik: rumah/kontrakan; lainnya: pemilik nomor.
+async function wStepPemilik(env, chatId, uid) {
+  const custom = await getCustomLabels(env, uid);
+  const rows = custom.length ? chunk(custom.map((o) => ({ text: "👤 " + o, callback_data: "w:own:" + o })), 2) : [];
+  rows.push([{ text: "✏️ Ketik nama", callback_data: "w:own:type" }, { text: "Lewati", callback_data: "w:own:skip" }]);
+  rows.push(CANCEL_ROW);
+  return sendMessage(env, chatId, "🏷️ Atas nama siapa? (opsional)\nBiar bisa bedain, mis. Telkomsel Nomerku vs Telkomsel Pacarku.", kb(rows));
+}
+async function wSetPemilik(env, chatId, uid, d, owner) {
+  owner = (owner || "").trim();
+  if (owner) await addCustomLabel(env, uid, owner);
+  d.owner = owner;
+  d.nama = joinNama(d.op, owner);
+  await saveDraft(env, uid, d);
+  // Listrik langsung ke tanggal bulanan; jenis lain pilih jadwal dulu.
+  return d.jenis === "listrik" ? wStepTanggal(env, chatId) : wStepSchedule(env, chatId);
 }
 function wStepSchedule(env, chatId) {
   const rows = [
