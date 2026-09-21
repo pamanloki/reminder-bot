@@ -107,6 +107,10 @@ async function routeMessage(env, chatId, msg) {
     await clearMode(env, uid);
     return wizardTyped(env, chatId, uid, mode.slice(2), text);
   }
+  if (mode && mode.startsWith("buy:")) {
+    await clearMode(env, uid);
+    return beliTanggalTyped(env, chatId, uid, Number(mode.slice(4)), text);
+  }
 
   return sendMessage(env, chatId, "Belum kebaca. Tekan /menu untuk pakai tombol,\natau ketik cepat: 'paket 30 15-9 IM3'.", BACK_MENU);
 }
@@ -125,7 +129,8 @@ async function handleCallback(env, cq) {
     if (data === "help") return sendMessage(env, chatId, helpText(), BACK_MENU);
     if (data === "hari") return sendMessage(env, chatId, `📆 Sekarang: ${namaHariTanggal(Date.now())} (WIB)`, BACK_MENU);
     if (data[0] === "w") return handleWizard(env, chatId, uid, data);
-    if (data.startsWith("done:")) return perpanjang(env, chatId, uid, Number(data.slice(5)));
+    if (data.startsWith("done:")) return sudahBeli(env, chatId, uid, Number(data.slice(5)));
+    if (data.startsWith("bt:")) { const [, id, when] = data.split(":"); return beliTanggal(env, chatId, uid, Number(id), when); }
     if (data.startsWith("del:")) return hapusReminder(env, chatId, uid, Number(data.slice(4)));
     if (data.startsWith("item:")) return sendItem(env, chatId, uid, Number(data.slice(5)));
   } catch (e) {
@@ -225,12 +230,12 @@ async function handleWizard(env, chatId, uid, data) {
   }
   if (step === "dur") {
     if (val === "type") { await setMode(env, uid, "w_dur"); return sendMessage(env, chatId, "Ketik jumlah hari (mis. 28):", kb([CANCEL_ROW])); }
-    d.schedType = "durasi"; d.durasi = +val; delete d.hariBulan; delete d.mulai; await saveDraft(env, uid, d); return wStepMulai(env, chatId);
+    d.schedType = "durasi"; d.durasi = +val; delete d.hariBulan; delete d.mulai; await saveDraft(env, uid, d); return wStepMulai(env, chatId, d.jenis);
   }
   if (step === "when") {
     if (val === "beli") { await setMode(env, uid, "w_beli"); return sendMessage(env, chatId, "Ketik tanggal beli/isi (mis. 10-9):", kb([CANCEL_ROW])); }
     if (val === "habis") { await setMode(env, uid, "w_habis"); return sendMessage(env, chatId, "Ketik tanggal habis masa aktif (mis. 8-10):", kb([CANCEL_ROW])); }
-    delete d.mulai; await saveDraft(env, uid, d); return wStepJam(env, chatId); // "today"
+    delete d.mulai; await saveDraft(env, uid, d); return afterMulai(env, chatId, d); // "today"
   }
   if (step === "tgl") {
     d.schedType = "tanggal"; d.hariBulan = +val; delete d.durasi; await saveDraft(env, uid, d); return wStepJam(env, chatId);
@@ -254,17 +259,17 @@ async function wizardTyped(env, chatId, uid, field, text) {
   if (field === "dur") {
     const n = parseInt(text, 10);
     if (!n || n < 1) return sendMessage(env, chatId, "Angka tidak valid. Ketik jumlah hari (mis. 28):", kb([CANCEL_ROW]));
-    d.schedType = "durasi"; d.durasi = n; delete d.hariBulan; delete d.mulai; await saveDraft(env, uid, d); return wStepMulai(env, chatId);
+    d.schedType = "durasi"; d.durasi = n; delete d.hariBulan; delete d.mulai; await saveDraft(env, uid, d); return wStepMulai(env, chatId, d.jenis);
   }
   if (field === "beli") {
     const ts = parseTanggal(text);
     if (ts == null) return sendMessage(env, chatId, "Tanggal tidak valid. Contoh: 10-9 (10 September).", kb([CANCEL_ROW]));
-    d.mulai = ts; await saveDraft(env, uid, d); return wStepJam(env, chatId);
+    d.mulai = ts; await saveDraft(env, uid, d); return afterMulai(env, chatId, d);
   }
   if (field === "habis") {
     const ts = parseTanggal(text);
     if (ts == null) return sendMessage(env, chatId, "Tanggal tidak valid. Contoh: 8-10 (8 Oktober).", kb([CANCEL_ROW]));
-    d.mulai = ts - (d.durasi || 30) * DAY; await saveDraft(env, uid, d); return wStepJam(env, chatId);
+    d.mulai = ts - (d.durasi || 30) * DAY; await saveDraft(env, uid, d); return afterMulai(env, chatId, d);
   }
   if (field === "jam") {
     const m = text.match(/(\d{1,2})[:.](\d{2})/);
@@ -295,9 +300,16 @@ async function wSetPemilik(env, chatId, uid, d, owner) {
   if (owner) await addCustomLabel(env, uid, owner);
   d.owner = owner;
   d.nama = joinNama(d.op, owner);
+  // Listrik: model berbasis tanggal beli (+ siklus ±30 hari), langsung tanya kapan beli.
+  if (d.jenis === "listrik") {
+    d.schedType = "durasi";
+    d.durasi = (JENIS.listrik && JENIS.listrik.durasi) || 30;
+    delete d.hariBulan;
+    await saveDraft(env, uid, d);
+    return wStepMulai(env, chatId, d.jenis);
+  }
   await saveDraft(env, uid, d);
-  // Listrik langsung ke tanggal bulanan; jenis lain pilih jadwal dulu.
-  return d.jenis === "listrik" ? wStepTanggal(env, chatId) : wStepSchedule(env, chatId);
+  return wStepSchedule(env, chatId);
 }
 function wStepSchedule(env, chatId) {
   const rows = [
@@ -313,20 +325,21 @@ function wStepDurasi(env, chatId) {
   rows.push(CANCEL_ROW);
   return sendMessage(env, chatId, "⏳ Masa aktif berapa hari?", kb(rows));
 }
-// Kapan mulainya: baru beli hari ini, atau paket lama yang sudah jalan.
-function wStepMulai(env, chatId) {
-  const rows = [
-    [{ text: "🆕 Baru isi hari ini", callback_data: "w:when:today" }],
-    [{ text: "⏰ Set tgl habis", callback_data: "w:when:habis" }],
-    [{ text: "📅 Set tgl beli", callback_data: "w:when:beli" }],
-    CANCEL_ROW,
-  ];
-  return sendMessage(
-    env,
-    chatId,
-    "📆 Kapan mulainya?\nKalau paket lama yang sudah jalan, set tanggal habisnya biar pas.",
-    kb(rows),
-  );
+// Kapan mulainya: baru beli hari ini, atau yang sudah jalan (set tgl beli/habis).
+function wStepMulai(env, chatId, jenis) {
+  const rows = [[{ text: "🆕 Baru isi hari ini", callback_data: "w:when:today" }]];
+  // Token listrik habis karena kepakai (bukan tanggal pasti) -> tak ada "set tgl habis".
+  if (jenis !== "listrik") rows.push([{ text: "⏰ Set tgl habis", callback_data: "w:when:habis" }]);
+  rows.push([{ text: "📅 Set tgl beli", callback_data: "w:when:beli" }]);
+  rows.push(CANCEL_ROW);
+  const msg = jenis === "listrik"
+    ? "📆 Beli tokennya kapan?\nAku ingatkan lagi sekitar sebulan setelahnya."
+    : "📆 Kapan mulainya?\nKalau paket lama yang sudah jalan, set tanggal habisnya biar pas.";
+  return sendMessage(env, chatId, msg, kb(rows));
+}
+// Setelah tanggal mulai diset: listrik langsung ke nominal (tanpa jam), lainnya tanya jam.
+function afterMulai(env, chatId, d) {
+  return d.jenis === "listrik" ? wStepNominal(env, chatId, d.jenis) : wStepJam(env, chatId);
 }
 function wStepTanggal(env, chatId) {
   const days = [];
@@ -559,15 +572,16 @@ async function sendItem(env, chatId, uid, id) {
         { text: "🗑️ Hapus", callback_data: `del:${it.id}` },
       ]
     : [
-        { text: "✅ Sudah beli / perpanjang", callback_data: `done:${it.id}` },
+        { text: "✅ Sudah beli / isi ulang", callback_data: `done:${it.id}` },
         { text: "🗑️ Hapus", callback_data: `del:${it.id}` },
       ];
   const rows = [btnBaris, [{ text: "🔙 Daftar", callback_data: "list" }, BACK_BTN]];
   return sendMessage(env, chatId, info, { reply_markup: { inline_keyboard: rows } });
 }
 
-// Perpanjang: mulai ulang dari hari ini.
-async function perpanjang(env, chatId, uid, id) {
+// Tombol "Sudah beli". Bulanan tanggal tetap -> lompat sebulan.
+// Berbasis durasi (pulsa/paket/listrik) -> tanya tanggal belinya biar akurat.
+async function sudahBeli(env, chatId, uid, id) {
   const list = await getItems(env, uid);
   const it = list.find((x) => x.id === id);
   if (!it) return sendMessage(env, chatId, "Pengingat tidak ditemukan.", BACK_MENU);
@@ -584,10 +598,46 @@ async function perpanjang(env, chatId, uid, id) {
       BACK_MENU,
     );
   }
-  it.mulai = todayTs();
+  const rows = [
+    [{ text: "🆕 Hari ini", callback_data: `bt:${it.id}:today` }],
+    [{ text: "✏️ Ketik tgl beli", callback_data: `bt:${it.id}:type` }],
+    [{ text: "🔙 Batal", callback_data: `item:${it.id}` }],
+  ];
+  return sendMessage(env, chatId, `✅ ${j.emoji} ${j.label}${it.nama ? " — " + it.nama : ""}\nKapan belinya?`, kb(rows));
+}
+
+// Terapkan tanggal beli -> reset masa aktif dari tanggal itu.
+async function terapkanBeli(env, chatId, uid, id, mulaiTs) {
+  const list = await getItems(env, uid);
+  const it = list.find((x) => x.id === id);
+  if (!it) return sendMessage(env, chatId, "Pengingat tidak ditemukan.", BACK_MENU);
+  const j = JENIS[it.jenis] || JENIS.lainnya;
+  it.mulai = mulaiTs;
+  delete it.skipUntil;
   await saveItems(env, uid, list);
   const due = dueTs(it);
-  return sendMessage(env, chatId, `✅ Diperbarui. ${j.emoji} ${j.label} berlaku sampai ${namaHariTanggal(due)}.`, BACK_MENU);
+  return sendMessage(
+    env,
+    chatId,
+    `✅ Diperbarui. ${j.emoji} ${j.label} beli ${namaHariTanggal(mulaiTs)}.\n🔔 Habis/isi lagi: ${namaHariTanggal(due)}${jamStr(it)} (${labelSisa(sisaHari(due))}).`,
+    BACK_MENU,
+  );
+}
+function beliTanggal(env, chatId, uid, id, when) {
+  if (when === "type") {
+    return setMode(env, uid, `buy:${id}`).then(() =>
+      sendMessage(env, chatId, "Ketik tanggal beli (mis. 20-9):", kb([[{ text: "🔙 Batal", callback_data: `item:${id}` }]])),
+    );
+  }
+  return terapkanBeli(env, chatId, uid, id, todayTs()); // "today"
+}
+async function beliTanggalTyped(env, chatId, uid, id, text) {
+  const ts = parseTanggal(text);
+  if (ts == null) {
+    await setMode(env, uid, `buy:${id}`); // minta ulang
+    return sendMessage(env, chatId, "Tanggal tidak valid. Contoh: 20-9 (20 September).", kb([[{ text: "🔙 Batal", callback_data: `item:${id}` }]]));
+  }
+  return terapkanBeli(env, chatId, uid, id, ts);
 }
 
 async function hapusReminder(env, chatId, uid, id) {
@@ -751,39 +801,49 @@ function helpText() {
     "",
     "━ CARA TAMBAH (paling gampang) ━",
     "/menu → tap jenis → ikuti langkahnya (semua tombol):",
-    "  jenis → operator → durasi/tanggal → jam → nominal → simpan.",
-    "Kamu cuma tap; ketik hanya kalau mau isi manual.",
+    "  ⚡ Listrik : jenis → atas nama → tgl beli → nominal",
+    "  📱🌐 Pulsa/Paket : jenis → operator → atas nama →",
+    "     masa aktif → kapan mulai → jam → nominal",
+    "Kamu cuma tap; ketik hanya kalau isi manual.",
+    "",
+    "🏷️ ATAS NAMA (opsional): biar bisa bedain nomor,",
+    "   mis. Telkomsel · Nomerku vs Telkomsel · Pacarku.",
+    "   Sekali ketik, tersimpan jadi tombol.",
+    "",
+    "📆 KAPAN MULAI (buat yang sudah jalan):",
+    "   • 🆕 Baru isi hari ini",
+    "   • ⏰ Set tgl habis  → mis. 8-10 (dihitung mundur)",
+    "   • 📅 Set tgl beli   → mis. 10-9",
+    "",
+    "⚡ Listrik pakai model tgl beli: diingatkan ~30 hari",
+    "   setelah beli. Tap 'Sudah beli' → set tgl beli baru.",
     "",
     "━ CARA TAMBAH CEPAT (ketik) ━",
-    "Atau ketik langsung. Dua cara:",
-    "",
     "1) Bulanan tanggal tetap:",
-    "   <jenis> tiap <tgl> [nama]",
-    "   • listrik tiap 25 100rb → tiap tanggal 25, tiap bulan",
-    "   • paket tiap 1          → tiap tanggal 1",
-    "",
+    "   <jenis> tiap <tgl> [nama]  • paket tiap 1",
     "2) Masa aktif (N hari):",
     "   <jenis> <hari> [tgl] [nama]",
-    "   • paket 30 15-9 IM3     → 30 hari, beli 15/9, nama IM3",
-    "   • pulsa 45              → 45 hari, mulai hari ini",
+    "   • paket 30 15-9 IM3  → 30 hari, beli 15/9, nama IM3",
+    "   • pulsa 45           → 45 hari, mulai hari ini",
     "",
     "jenis: listrik / pulsa / paket / lainnya",
     "  (alias: token, pln, kuota, internet, data)",
+    "Opsional jam habis: tambah 'jam HH:MM' (mis. paket 30 jam 23:59)",
     "",
-    "Opsional jam habis (bagus buat paket): tambah 'jam HH:MM'",
-    "  • paket 30 20-9 jam 23:59",
-    "  • paket tiap 25 jam 14:30",
+    "━ KALAU SUDAH BELI / ISI ULANG ━",
+    "/list → tap item → ✅ Sudah beli:",
+    "  • Pulsa/paket/listrik: pilih 'Hari ini' atau ketik tgl beli",
+    "    → masa aktif dihitung dari tanggal itu.",
+    "  • Bulanan tanggal tetap: otomatis lewati ke bulan depan.",
     "",
     "━ NOTIFIKASI ━",
-    "Aku kirim pengingat otomatis menjelang habis:",
+    "Pengingat otomatis menjelang habis:",
     "🟢 aman   ⚠️ mepet (≤ H-3)   🔴 habis / telat",
     "",
     "━ PERINTAH ━",
     "/menu — tombol tambah & daftar",
     "/list — lihat semua pengingat + status",
     "/hari — tanggal sekarang",
-    "",
-    "Di /list: tap item → ✅ Sudah beli/perpanjang, atau 🗑️ Hapus.",
   ].join("\n");
 }
 
