@@ -89,6 +89,7 @@ async function routeMessage(env, chatId, msg) {
   if (lower.startsWith("/menu")) return sendMenu(env, chatId);
   if (lower.startsWith("/setup")) return setupMenuButton(env, chatId);
   if (lower.startsWith("/tambah") || lower.startsWith("/add")) return sendMenu(env, chatId);
+  if (lower.startsWith("/dashboard") || lower.startsWith("/dash")) return sendDashboard(env, chatId, uid);
   if (lower.startsWith("/list") || lower.startsWith("/daftar")) return sendList(env, chatId, uid);
   if (lower.startsWith("/hari") || lower.startsWith("/tanggal")) return sendMessage(env, chatId, `📆 Sekarang: ${namaHariTanggal(Date.now())} (WIB)`);
   if (lower.startsWith("/riwayat") || lower.startsWith("/history")) return sendRiwayat(env, chatId, uid);
@@ -142,6 +143,7 @@ async function handleCallback(env, cq) {
 
   try {
     if (data === "menu") { await clearDraft(env, uid); return sendMenu(env, chatId); }
+    if (data === "dash") return sendDashboard(env, chatId, uid);
     if (data === "list") return sendList(env, chatId, uid);
     if (data === "help") return sendMessage(env, chatId, helpText(), BACK_MENU);
     if (data === "hari") return sendMessage(env, chatId, `📆 Sekarang: ${namaHariTanggal(Date.now())} (WIB)`, BACK_MENU);
@@ -554,6 +556,47 @@ function parseAdd(s, j) {
     s = (s.slice(0, dur.index) + s.slice(dur.index + dur[0].length)).replace(/\s+/g, " ").trim();
   }
   return { durasi: durasi || j.durasi, mulai, nama: s.trim(), jamMenit };
+}
+
+// Dashboard: ringkasan sekilas — apa yang perlu aksi, mepet, dan aman.
+async function sendDashboard(env, chatId, uid) {
+  const list = await getItems(env, uid);
+  if (!list.length) {
+    return sendMessage(env, chatId, "📊 Dashboard kosong.\nBelum ada pengingat — tap jenis di /menu untuk menambah.", MENU_MAIN);
+  }
+  const rows = list
+    .map((it) => ({ it, sisa: sisaHari(dueTs(it)), snz: snoozed(it) }))
+    .sort((a, b) => a.sisa - b.sisa);
+  const perlu = rows.filter((r) => r.sisa <= 0);
+  const mepet = rows.filter((r) => r.sisa > 0 && r.sisa <= (r.it.ingatkan || 3));
+  const aman = rows.filter((r) => r.sisa > (r.it.ingatkan || 3));
+  const snzCount = rows.filter((r) => r.snz).length;
+
+  const nm = (it) => {
+    const j = JENIS[it.jenis] || JENIS.lainnya;
+    return `${j.emoji} ${j.label}${it.nama ? " · " + it.nama : ""}`;
+  };
+  const line = (r) => `• ${nm(r.it)} — ${labelSisa(r.sisa)}${jamStr(r.it)}${r.snz ? " 😴" : ""}`;
+
+  const out = ["📊 DASHBOARD PENGINGAT", `📆 ${namaHariTanggal(Date.now())}`, ""];
+  out.push(`🔴 Perlu aksi — ${perlu.length}`);
+  perlu.length ? perlu.forEach((r) => out.push(line(r))) : out.push("• 👍 tidak ada yang telat/jatuh tempo");
+  if (mepet.length) {
+    out.push("", `⚠️ Mepet — ${mepet.length}`);
+    mepet.forEach((r) => out.push(line(r)));
+  }
+  out.push("", `🟢 Aman — ${aman.length}`);
+  if (aman.length) out.push(`• terdekat: ${nm(aman[0].it)} — ${labelSisa(aman[0].sisa)}`);
+  out.push("", `Σ Total ${rows.length} pengingat${snzCount ? ` · 😴 ${snzCount} di-snooze` : ""}`);
+
+  // Tombol aksi cepat untuk yang perlu perhatian (maks 6).
+  const btns = [...perlu, ...mepet].slice(0, 6).map((r) => [{
+    text: `${(JENIS[r.it.jenis] || JENIS.lainnya).emoji} ${r.it.nama || (JENIS[r.it.jenis] || JENIS.lainnya).label} — ${labelSisa(r.sisa)}`,
+    callback_data: `item:${r.it.id}`,
+  }]);
+  btns.push([{ text: "📋 Daftar lengkap", callback_data: "list" }, { text: "🔄 Refresh", callback_data: "dash" }]);
+  btns.push([BACK_BTN]);
+  return sendMessage(env, chatId, out.join("\n"), kb(btns));
 }
 
 async function sendList(env, chatId, uid) {
@@ -1000,7 +1043,10 @@ const MENU_MAIN = {
         { text: "🌐 Paket Internet", callback_data: "w:jenis:paket" },
         { text: "🔔 Lainnya", callback_data: "w:jenis:lainnya" },
       ],
-      [{ text: "📋 Daftar pengingat", callback_data: "list" }],
+      [
+        { text: "📊 Dashboard", callback_data: "dash" },
+        { text: "📋 Daftar", callback_data: "list" },
+      ],
       [
         { text: "📆 Hari ini", callback_data: "hari" },
         { text: "❓ Bantuan", callback_data: "help" },
@@ -1068,6 +1114,7 @@ function helpText() {
     "",
     "━ PERINTAH ━",
     "/menu — tombol tambah & daftar",
+    "/dashboard — ringkasan sekilas (perlu aksi / mepet / aman)",
     "/list — lihat semua pengingat + status",
     "/riwayat — riwayat isi ulang (+ hitungan bulan ini)",
     "/backup — simpan semua data ke file .json",
@@ -1079,6 +1126,7 @@ function helpText() {
 async function setupMenuButton(env, chatId) {
   const commands = [
     { command: "menu", description: "Tambah pengingat / lihat daftar" },
+    { command: "dashboard", description: "Ringkasan sekilas semua pengingat" },
     { command: "list", description: "Daftar pengingat" },
     { command: "tambah", description: "Tambah pengingat" },
     { command: "riwayat", description: "Riwayat isi ulang" },
