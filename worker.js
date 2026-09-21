@@ -97,14 +97,18 @@ async function routeMessage(env, chatId, msg) {
     return addReminder(env, chatId, uid, alias[firstWord], text.slice(firstWord.length).trim());
   }
 
-  // Kalau lagi menunggu input dari tombol (mode add:<jenis>).
+  // Kalau lagi menunggu input dari tombol.
   const mode = await getMode(env, uid);
   if (mode && mode.startsWith("add:")) {
     await clearMode(env, uid);
     return addReminder(env, chatId, uid, mode.slice(4), text);
   }
+  if (mode && mode.startsWith("w_")) {
+    await clearMode(env, uid);
+    return wizardTyped(env, chatId, uid, mode.slice(2), text);
+  }
 
-  return sendMessage(env, chatId, "Belum kebaca. Contoh: 'paket 30 15-9 IM3'\nAtau tekan /menu.", BACK_MENU);
+  return sendMessage(env, chatId, "Belum kebaca. Tekan /menu untuk pakai tombol,\natau ketik cepat: 'paket 30 15-9 IM3'.", BACK_MENU);
 }
 
 async function handleCallback(env, cq) {
@@ -116,14 +120,11 @@ async function handleCallback(env, cq) {
   if (!isAllowed(env, uid, chatId)) return sendMessage(env, chatId, "Maaf, bot ini privat.");
 
   try {
-    if (data === "menu") return sendMenu(env, chatId);
+    if (data === "menu") { await clearDraft(env, uid); return sendMenu(env, chatId); }
     if (data === "list") return sendList(env, chatId, uid);
     if (data === "help") return sendMessage(env, chatId, helpText(), BACK_MENU);
-    if (data.startsWith("add_")) {
-      const jenis = data.slice(4);
-      await setMode(env, uid, "add:" + jenis);
-      return sendMessage(env, chatId, addPromptText(jenis), BACK_MENU);
-    }
+    if (data === "hari") return sendMessage(env, chatId, `📆 Sekarang: ${namaHariTanggal(Date.now())} (WIB)`, BACK_MENU);
+    if (data[0] === "w") return handleWizard(env, chatId, uid, data);
     if (data.startsWith("done:")) return perpanjang(env, chatId, uid, Number(data.slice(5)));
     if (data.startsWith("del:")) return hapusReminder(env, chatId, uid, Number(data.slice(4)));
     if (data.startsWith("item:")) return sendItem(env, chatId, uid, Number(data.slice(5)));
@@ -133,7 +134,175 @@ async function handleCallback(env, cq) {
 }
 
 // ---------------------------------------------------------------------------
-// Tambah / kelola pengingat
+// WIZARD (tambah pengingat lewat tombol, minim ketik)
+// ---------------------------------------------------------------------------
+
+const OPERATORS = ["IM3", "Telkomsel", "XL", "Axis", "Tri", "Smartfren", "by.U"];
+const DUR_PRESET = [7, 15, 28, 30, 60, 90];
+const JAM_PRESET = [
+  ["00:00", 0], ["08:00", 480], ["12:00", 720], ["17:00", 1020], ["23:59", 1439],
+];
+const NOM_PRESET = ["5rb", "10rb", "25rb", "50rb", "100rb"];
+
+function draftKey(uid) { return `draft:${uid}`; }
+async function getDraft(env, uid) { const r = await env.REMINDERS.get(draftKey(uid)); return r ? JSON.parse(r) : null; }
+async function saveDraft(env, uid, d) { await env.REMINDERS.put(draftKey(uid), JSON.stringify(d), { expirationTtl: 1800 }); }
+async function clearDraft(env, uid) { await env.REMINDERS.delete(draftKey(uid)); }
+
+const CANCEL_ROW = [{ text: "✖️ Batal", callback_data: "menu" }];
+function kb(rows) { return { reply_markup: { inline_keyboard: rows } }; }
+function chunk(arr, n) { const out = []; for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n)); return out; }
+
+async function handleWizard(env, chatId, uid, data) {
+  const parts = data.split(":");
+  const step = parts[1];
+  const val = parts.slice(2).join(":");
+
+  if (step === "jenis") {
+    await saveDraft(env, uid, { jenis: val });
+    if (val === "pulsa" || val === "paket") return wStepOperator(env, chatId);
+    return wStepSchedule(env, chatId);
+  }
+
+  const d = await getDraft(env, uid);
+  if (!d) return sendMessage(env, chatId, "Sesi kadaluarsa. Mulai lagi dari /menu.", BACK_MENU);
+
+  if (step === "op") {
+    if (val === "type") { await setMode(env, uid, "w_op"); return sendMessage(env, chatId, "Ketik nama operator:", kb([CANCEL_ROW])); }
+    d.nama = val; await saveDraft(env, uid, d); return wStepSchedule(env, chatId);
+  }
+  if (step === "sched") {
+    return val === "tanggal" ? wStepTanggal(env, chatId) : wStepDurasi(env, chatId);
+  }
+  if (step === "dur") {
+    if (val === "type") { await setMode(env, uid, "w_dur"); return sendMessage(env, chatId, "Ketik jumlah hari (mis. 28):", kb([CANCEL_ROW])); }
+    d.schedType = "durasi"; d.durasi = +val; delete d.hariBulan; await saveDraft(env, uid, d); return wStepJam(env, chatId);
+  }
+  if (step === "tgl") {
+    d.schedType = "tanggal"; d.hariBulan = +val; delete d.durasi; await saveDraft(env, uid, d); return wStepJam(env, chatId);
+  }
+  if (step === "jam") {
+    if (val === "type") { await setMode(env, uid, "w_jam"); return sendMessage(env, chatId, "Ketik jam (HH:MM), mis. 14:30:", kb([CANCEL_ROW])); }
+    d.jamMenit = val === "none" ? null : +val; await saveDraft(env, uid, d); return wStepNominal(env, chatId);
+  }
+  if (step === "nom") {
+    if (val === "type") { await setMode(env, uid, "w_nom"); return sendMessage(env, chatId, "Ketik nominal (mis. 50rb):", kb([CANCEL_ROW])); }
+    if (val !== "skip") d.nominal = val; await saveDraft(env, uid, d); return wStepConfirm(env, chatId, d);
+  }
+  if (step === "save") return wSave(env, chatId, uid);
+}
+
+async function wizardTyped(env, chatId, uid, field, text) {
+  const d = await getDraft(env, uid);
+  if (!d) return sendMessage(env, chatId, "Sesi kadaluarsa. Mulai lagi dari /menu.", BACK_MENU);
+  if (field === "op") { d.nama = text.trim(); await saveDraft(env, uid, d); return wStepSchedule(env, chatId); }
+  if (field === "dur") {
+    const n = parseInt(text, 10);
+    if (!n || n < 1) return sendMessage(env, chatId, "Angka tidak valid. Ketik jumlah hari (mis. 28):", kb([CANCEL_ROW]));
+    d.schedType = "durasi"; d.durasi = n; delete d.hariBulan; await saveDraft(env, uid, d); return wStepJam(env, chatId);
+  }
+  if (field === "jam") {
+    const m = text.match(/(\d{1,2})[:.](\d{2})/);
+    if (!m || +m[1] > 23 || +m[2] > 59) return sendMessage(env, chatId, "Jam tidak valid. Contoh: 14:30", kb([CANCEL_ROW]));
+    d.jamMenit = +m[1] * 60 + +m[2]; await saveDraft(env, uid, d); return wStepNominal(env, chatId);
+  }
+  if (field === "nom") { d.nominal = text.trim(); await saveDraft(env, uid, d); return wStepConfirm(env, chatId, d); }
+}
+
+function wStepOperator(env, chatId) {
+  const rows = chunk(OPERATORS.map((o) => ({ text: o, callback_data: "w:op:" + o })), 2);
+  rows.push([{ text: "✏️ Lainnya (ketik)", callback_data: "w:op:type" }]);
+  rows.push(CANCEL_ROW);
+  return sendMessage(env, chatId, "📱 Pilih operator:", kb(rows));
+}
+function wStepSchedule(env, chatId) {
+  const rows = [
+    [{ text: "⏳ Masa aktif (hari)", callback_data: "w:sched:durasi" }],
+    [{ text: "🔁 Tiap tanggal (bulanan)", callback_data: "w:sched:tanggal" }],
+    CANCEL_ROW,
+  ];
+  return sendMessage(env, chatId, "Pilih cara pengingat:", kb(rows));
+}
+function wStepDurasi(env, chatId) {
+  const rows = chunk(DUR_PRESET.map((n) => ({ text: n + " hari", callback_data: "w:dur:" + n })), 3);
+  rows.push([{ text: "✏️ Lainnya (ketik)", callback_data: "w:dur:type" }]);
+  rows.push(CANCEL_ROW);
+  return sendMessage(env, chatId, "⏳ Masa aktif berapa hari?", kb(rows));
+}
+function wStepTanggal(env, chatId) {
+  const days = [];
+  for (let i = 1; i <= 31; i++) days.push({ text: String(i), callback_data: "w:tgl:" + i });
+  const rows = chunk(days, 7);
+  rows.push(CANCEL_ROW);
+  return sendMessage(env, chatId, "🔁 Tiap tanggal berapa?", kb(rows));
+}
+function wStepJam(env, chatId) {
+  const rows = chunk(JAM_PRESET.map(([lbl, m]) => ({ text: "🕐 " + lbl, callback_data: "w:jam:" + m })), 3);
+  rows.push([
+    { text: "Tanpa jam", callback_data: "w:jam:none" },
+    { text: "✏️ Ketik jam", callback_data: "w:jam:type" },
+  ]);
+  rows.push(CANCEL_ROW);
+  return sendMessage(env, chatId, "🕐 Jam habis? (opsional)", kb(rows));
+}
+function wStepNominal(env, chatId) {
+  const rows = chunk(NOM_PRESET.map((n) => ({ text: "Rp" + n, callback_data: "w:nom:" + n })), 3);
+  rows.push([
+    { text: "Lewati", callback_data: "w:nom:skip" },
+    { text: "✏️ Ketik", callback_data: "w:nom:type" },
+  ]);
+  rows.push(CANCEL_ROW);
+  return sendMessage(env, chatId, "💰 Nominal? (opsional)", kb(rows));
+}
+function wStepConfirm(env, chatId, d) {
+  const item = draftToItem(d);
+  const j = JENIS[d.jenis] || JENIS.lainnya;
+  const due = dueTs(item);
+  const jadwal = item.hariBulan ? `🔁 Tiap tanggal ${item.hariBulan}` : `⏳ ${item.durasi} hari (mulai hari ini)`;
+  const info = [
+    "Cek dulu ya:",
+    "",
+    `${j.emoji} ${j.label}${item.nama ? " — " + item.nama : ""}`,
+    jadwal,
+    `🔔 Berikutnya: ${namaHariTanggal(due)}${jamStr(item)}`,
+  ].join("\n");
+  return sendMessage(env, chatId, info, kb([
+    [{ text: "✅ Simpan", callback_data: "w:save" }],
+    CANCEL_ROW,
+  ]));
+}
+
+function draftToItem(d) {
+  const j = JENIS[d.jenis] || JENIS.lainnya;
+  let nama = d.nama || "";
+  if (d.nominal) nama = nama ? nama + " · " + d.nominal : d.nominal;
+  const item = { id: Date.now(), jenis: d.jenis, nama, ingatkan: j.ingatkan };
+  if (d.schedType === "tanggal") item.hariBulan = d.hariBulan;
+  else { item.mulai = todayTs(); item.durasi = d.durasi || j.durasi; }
+  if (d.jamMenit != null) item.jamMenit = d.jamMenit;
+  return item;
+}
+
+async function wSave(env, chatId, uid) {
+  const d = await getDraft(env, uid);
+  if (!d) return sendMessage(env, chatId, "Sesi kadaluarsa. Mulai lagi dari /menu.", BACK_MENU);
+  const item = draftToItem(d);
+  const list = await getItems(env, uid);
+  list.push(item);
+  await saveItems(env, uid, list);
+  await clearDraft(env, uid);
+  const j = JENIS[d.jenis] || JENIS.lainnya;
+  const due = dueTs(item);
+  return sendMessage(
+    env,
+    chatId,
+    `✅ Pengingat dibuat:\n${j.emoji} ${j.label}${item.nama ? " — " + item.nama : ""}\n🔔 Berikutnya: ${namaHariTanggal(due)}${jamStr(item)} (${labelSisa(sisaHari(due))})`,
+    BACK_MENU,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tambah / kelola pengingat (teks cepat)
 // ---------------------------------------------------------------------------
 
 async function addReminder(env, chatId, uid, jenis, argStr) {
@@ -422,15 +591,16 @@ const MENU_MAIN = {
   reply_markup: {
     inline_keyboard: [
       [
-        { text: "⚡ Token Listrik", callback_data: "add_listrik" },
-        { text: "📱 Pulsa", callback_data: "add_pulsa" },
+        { text: "⚡ Token Listrik", callback_data: "w:jenis:listrik" },
+        { text: "📱 Pulsa", callback_data: "w:jenis:pulsa" },
       ],
       [
-        { text: "🌐 Paket Internet", callback_data: "add_paket" },
-        { text: "🔔 Lainnya", callback_data: "add_lainnya" },
+        { text: "🌐 Paket Internet", callback_data: "w:jenis:paket" },
+        { text: "🔔 Lainnya", callback_data: "w:jenis:lainnya" },
       ],
+      [{ text: "📋 Daftar pengingat", callback_data: "list" }],
       [
-        { text: "📋 Daftar pengingat", callback_data: "list" },
+        { text: "📆 Hari ini", callback_data: "hari" },
         { text: "❓ Bantuan", callback_data: "help" },
       ],
     ],
@@ -441,37 +611,17 @@ async function sendMenu(env, chatId) {
   return sendMessage(env, chatId, "🔔 Menu Pengingat\nTambah pengingat baru atau lihat daftar:", MENU_MAIN);
 }
 
-// Instruksi input per jenis (dipakai setelah tekan tombol).
-function addPromptText(jenis) {
-  const j = JENIS[jenis] || JENIS.lainnya;
-  const contoh = {
-    listrik: "tiap 25 100rb      → tiap tanggal 25 tiap bulan (nama 100rb)\n30                 → ingat tiap 30 hari sejak hari ini",
-    pulsa: "45                 → masa aktif 45 hari, mulai hari ini\n30 20-9 XL         → beli 20-9, nama XL",
-    paket: "30 20-9 IM3        → paket 30 hari, beli 20-9, nama IM3\n30 20-9 jam 14:30  → habis jam 14:30 (paket sering habis di jam tertentu)",
-    lainnya: "tiap 10            → tiap tanggal 10 tiap bulan\n30 20-9 nama       → jatuh tempo 30 hari sejak 20-9",
-  };
-  return [
-    `${j.emoji} ${j.label}`,
-    "",
-    "Dua cara:",
-    "• Bulanan tetap:  tiap <tgl>   → mis. tiap 25",
-    "• Masa aktif:     <hari> [tgl] → mis. 30 20-9",
-    "",
-    "Contoh:",
-    contoh[jenis] || contoh.lainnya,
-    "",
-    `(default ${j.durasi} hari · ingat mulai H-${j.ingatkan})`,
-  ].join("\n");
-}
-
 function helpText() {
   return [
     "🔔 BOT PENGINGAT",
     "Ingatkan token listrik, pulsa, & masa aktif paket internet.",
     "",
-    "━ CARA TAMBAH ━",
-    "Paling gampang: /menu → tap jenisnya → ikuti contohnya.",
+    "━ CARA TAMBAH (paling gampang) ━",
+    "/menu → tap jenis → ikuti langkahnya (semua tombol):",
+    "  jenis → operator → durasi/tanggal → jam → nominal → simpan.",
+    "Kamu cuma tap; ketik hanya kalau mau isi manual.",
     "",
+    "━ CARA TAMBAH CEPAT (ketik) ━",
     "Atau ketik langsung. Dua cara:",
     "",
     "1) Bulanan tanggal tetap:",
