@@ -75,6 +75,8 @@ async function handleTelegram(request, env) {
 
 async function routeMessage(env, chatId, msg) {
   const uid = msg.from.id;
+  // File masuk (untuk /restore).
+  if (msg.document) return handleIncomingDoc(env, chatId, uid, msg);
   const text = (msg.text || "").trim();
   if (!text) return sendMessage(env, chatId, "Ketik /menu untuk mulai.");
 
@@ -89,6 +91,12 @@ async function routeMessage(env, chatId, msg) {
   if (lower.startsWith("/tambah") || lower.startsWith("/add")) return sendMenu(env, chatId);
   if (lower.startsWith("/list") || lower.startsWith("/daftar")) return sendList(env, chatId, uid);
   if (lower.startsWith("/hari") || lower.startsWith("/tanggal")) return sendMessage(env, chatId, `📆 Sekarang: ${namaHariTanggal(Date.now())} (WIB)`);
+  if (lower.startsWith("/riwayat") || lower.startsWith("/history")) return sendRiwayat(env, chatId, uid);
+  if (lower.startsWith("/backup") || lower.startsWith("/export")) return sendBackup(env, chatId, uid);
+  if (lower.startsWith("/restore") || lower.startsWith("/import")) {
+    await setMode(env, uid, "restore");
+    return sendMessage(env, chatId, "♻️ Kirim file backup (.json) yang dulu kamu simpan, atau paste isi JSON-nya.\nData sekarang akan diganti.", kb([[BACK_BTN]]));
+  }
 
   // Jenis di awal teks -> tambah cepat.
   const firstWord = lower.split(/\s+/)[0];
@@ -116,6 +124,10 @@ async function routeMessage(env, chatId, msg) {
     const [, id, field] = mode.split(":");
     return applyEdit(env, chatId, uid, Number(id), field, text);
   }
+  if (mode === "restore") {
+    await clearMode(env, uid);
+    return doRestore(env, chatId, uid, text);
+  }
 
   return sendMessage(env, chatId, "Belum kebaca. Tekan /menu untuk pakai tombol,\natau ketik cepat: 'paket 30 15-9 IM3'.", BACK_MENU);
 }
@@ -138,6 +150,8 @@ async function handleCallback(env, cq) {
     if (data.startsWith("bt:")) { const [, id, when] = data.split(":"); return beliTanggal(env, chatId, uid, Number(id), when); }
     if (data.startsWith("edit:")) return sendEditMenu(env, chatId, uid, Number(data.slice(5)));
     if (data.startsWith("ed:")) { const [, id, field] = data.split(":"); return editField(env, chatId, uid, Number(id), field); }
+    if (data.startsWith("ej:")) { const [, id, jenis] = data.split(":"); return editJenis(env, chatId, uid, Number(id), jenis); }
+    if (data.startsWith("snz:")) return snoozeItem(env, chatId, uid, Number(data.slice(4)));
     if (data.startsWith("del:")) return hapusReminder(env, chatId, uid, Number(data.slice(4)));
     if (data.startsWith("item:")) return sendItem(env, chatId, uid, Number(data.slice(5)));
   } catch (e) {
@@ -605,12 +619,18 @@ async function sendEditMenu(env, chatId, uid, id) {
   }
   rows.push([{ text: "🕐 Jam", callback_data: `ed:${it.id}:jam` }]);
   rows.push([{ text: "🔔 Ingatkan H-berapa", callback_data: `ed:${it.id}:ingatkan` }]);
+  rows.push([{ text: "🔀 Ganti jenis", callback_data: `ed:${it.id}:jenis` }]);
   rows.push([{ text: "🔙 Kembali", callback_data: `item:${it.id}` }]);
   return sendMessage(env, chatId, `✏️ Edit ${j.emoji} ${j.label}${it.nama ? " — " + it.nama : ""}\nPilih yang mau diubah:`, kb(rows));
 }
 
-// Tekan salah satu field edit -> minta input teks.
+// Tekan salah satu field edit -> minta input teks (atau tombol untuk jenis).
 async function editField(env, chatId, uid, id, field) {
+  if (field === "jenis") {
+    const rows = chunk(Object.keys(JENIS).map((jk) => ({ text: `${JENIS[jk].emoji} ${JENIS[jk].label}`, callback_data: `ej:${id}:${jk}` })), 2);
+    rows.push([{ text: "🔙 Batal", callback_data: `item:${id}` }]);
+    return sendMessage(env, chatId, "🔀 Ganti jenis jadi:", kb(rows));
+  }
   const prompts = {
     nama: "Ketik nama/label baru (mis. Telkomsel · Nomerku · 50rb):",
     durasi: "Ketik masa aktif baru (jumlah hari, mis. 30):",
@@ -667,6 +687,103 @@ async function applyEdit(env, chatId, uid, id, field, text) {
   return sendItem(env, chatId, uid, id);
 }
 
+// Ganti jenis item lewat tombol.
+async function editJenis(env, chatId, uid, id, jenis) {
+  if (!JENIS[jenis]) return sendMessage(env, chatId, "Jenis tidak dikenal.", BACK_MENU);
+  const list = await getItems(env, uid);
+  const it = list.find((x) => x.id === id);
+  if (!it) return sendMessage(env, chatId, "Pengingat tidak ditemukan.", BACK_MENU);
+  it.jenis = jenis;
+  await saveItems(env, uid, list);
+  await sendMessage(env, chatId, "✅ Jenis diganti.");
+  return sendItem(env, chatId, uid, id);
+}
+
+// Snooze: ingatkan lagi besok.
+async function snoozeItem(env, chatId, uid, id) {
+  const list = await getItems(env, uid);
+  const it = list.find((x) => x.id === id);
+  if (!it) return sendMessage(env, chatId, "Pengingat tidak ditemukan.", BACK_MENU);
+  it.snoozeUntil = todayTs() + DAY; // besok
+  await saveItems(env, uid, list);
+  const j = JENIS[it.jenis] || JENIS.lainnya;
+  return sendMessage(env, chatId, `😴 Oke, ${j.emoji} ${j.label}${it.nama ? " — " + it.nama : ""} aku ingatkan lagi besok.`, BACK_MENU);
+}
+
+// ---------------------------------------------------------------------------
+// Riwayat isi ulang
+// ---------------------------------------------------------------------------
+
+async function logRiwayat(env, uid, it, ts) {
+  try {
+    const raw = await env.REMINDERS.get(`hist:${uid}`);
+    const arr = raw ? JSON.parse(raw) : [];
+    const j = JENIS[it.jenis] || JENIS.lainnya;
+    arr.unshift({ jenis: it.jenis, label: j.label, nama: it.nama || "", ts: ts || Date.now() });
+    await env.REMINDERS.put(`hist:${uid}`, JSON.stringify(arr.slice(0, 60)));
+  } catch { /* abaikan */ }
+}
+
+async function sendRiwayat(env, chatId, uid) {
+  const raw = await env.REMINDERS.get(`hist:${uid}`);
+  const arr = raw ? JSON.parse(raw) : [];
+  if (!arr.length) return sendMessage(env, chatId, "📜 Belum ada riwayat. Tekan ✅ Sudah beli saat mengisi ulang, nanti tercatat di sini.", BACK_MENU);
+  const now = wibParts(Date.now());
+  const bulanIni = arr.filter((r) => { const p = wibParts(r.ts); return p.y === now.y && p.m === now.m; });
+  const lines = [`📜 Riwayat isi ulang (${bulanIni.length}x bulan ini)`, ""];
+  for (const r of arr.slice(0, 20)) {
+    const j = JENIS[r.jenis] || JENIS.lainnya;
+    lines.push(`${j.emoji} ${r.label}${r.nama ? " — " + r.nama : ""}\n   ${namaHariTanggal(r.ts)}`);
+  }
+  return sendMessage(env, chatId, lines.join("\n"), BACK_MENU);
+}
+
+// ---------------------------------------------------------------------------
+// Backup & restore
+// ---------------------------------------------------------------------------
+
+async function sendBackup(env, chatId, uid) {
+  const items = await getItems(env, uid);
+  const ops = JSON.parse((await env.REMINDERS.get(`ops:${uid}`)) || "[]");
+  const labels = JSON.parse((await env.REMINDERS.get(`labels:${uid}`)) || "[]");
+  const hist = JSON.parse((await env.REMINDERS.get(`hist:${uid}`)) || "[]");
+  const data = { v: 1, exportedAt: Date.now(), items, ops, labels, hist };
+  const p = wibParts(Date.now());
+  const fname = `reminder-backup-${p.y}${pad(p.m)}${pad(p.d)}.json`;
+  await sendDocument(env, chatId, fname, JSON.stringify(data, null, 2));
+  return sendMessage(env, chatId, `💾 Backup ${items.length} pengingat. Simpan filenya baik-baik.\nUntuk memulihkan: /restore lalu kirim file ini.`);
+}
+
+async function handleIncomingDoc(env, chatId, uid, msg) {
+  const mode = await getMode(env, uid);
+  if (mode !== "restore") {
+    return sendMessage(env, chatId, "Kalau mau memulihkan data, ketik /restore dulu, baru kirim filenya.", BACK_MENU);
+  }
+  await clearMode(env, uid);
+  try {
+    const fileId = msg.document.file_id;
+    const gf = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`).then((r) => r.json());
+    if (!gf.ok) throw new Error("gagal ambil file");
+    const path = gf.result.file_path;
+    const content = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${path}`).then((r) => r.text());
+    return doRestore(env, chatId, uid, content);
+  } catch (e) {
+    return sendMessage(env, chatId, "Gagal baca file: " + (e && e.message ? e.message : e), BACK_MENU);
+  }
+}
+
+async function doRestore(env, chatId, uid, content) {
+  let data;
+  try { data = JSON.parse(content); } catch { return sendMessage(env, chatId, "❌ Isi bukan JSON yang valid.", BACK_MENU); }
+  const items = Array.isArray(data) ? data : data.items;
+  if (!Array.isArray(items)) return sendMessage(env, chatId, "❌ Format backup tidak dikenal.", BACK_MENU);
+  await saveItems(env, uid, items);
+  if (Array.isArray(data.ops)) await env.REMINDERS.put(`ops:${uid}`, JSON.stringify(data.ops.slice(0, 30)));
+  if (Array.isArray(data.labels)) await env.REMINDERS.put(`labels:${uid}`, JSON.stringify(data.labels.slice(0, 30)));
+  if (Array.isArray(data.hist)) await env.REMINDERS.put(`hist:${uid}`, JSON.stringify(data.hist.slice(0, 60)));
+  return sendMessage(env, chatId, `✅ Dipulihkan: ${items.length} pengingat. Buka /list untuk cek.`, BACK_MENU);
+}
+
 // Tombol "Sudah beli". Bulanan tanggal tetap -> lompat sebulan.
 // Berbasis durasi (pulsa/paket/listrik) -> tanya tanggal belinya biar akurat.
 async function sudahBeli(env, chatId, uid, id) {
@@ -677,7 +794,9 @@ async function sudahBeli(env, chatId, uid, id) {
   if (it.hariBulan) {
     // Lewati tanggal terdekat -> pengingat lompat ke bulan berikutnya.
     it.skipUntil = dueTs(it);
+    delete it.snoozeUntil;
     await saveItems(env, uid, list);
+    await logRiwayat(env, uid, it, Date.now());
     const next = dueTs(it);
     return sendMessage(
       env,
@@ -702,7 +821,9 @@ async function terapkanBeli(env, chatId, uid, id, mulaiTs) {
   const j = JENIS[it.jenis] || JENIS.lainnya;
   it.mulai = mulaiTs;
   delete it.skipUntil;
+  delete it.snoozeUntil;
   await saveItems(env, uid, list);
+  await logRiwayat(env, uid, it, mulaiTs);
   const due = dueTs(it);
   return sendMessage(
     env,
@@ -742,8 +863,15 @@ async function hapusReminder(env, chatId, uid, id) {
 // Notifikasi terjadwal (Cron)
 // ---------------------------------------------------------------------------
 
+// Item lagi di-snooze? (ingatkan lagi besok -> jangan kirim hari ini)
+function snoozed(it) {
+  return it.snoozeUntil != null && sisaHari(it.snoozeUntil) > 0;
+}
+
 async function runScheduled(env) {
   if (!env.REMINDERS) return;
+  const hourNow = wibParts(Date.now()).h;
+  const isDigest = hourNow === 8; // ringkasan harian pagi (cron 08:00 WIB)
   let cursor;
   do {
     const res = await env.REMINDERS.list({ prefix: "rem:", cursor });
@@ -751,14 +879,14 @@ async function runScheduled(env) {
       const uid = k.name.slice(4);
       try {
         const list = JSON.parse((await env.REMINDERS.get(k.name)) || "[]");
-        const due = [];
         for (const it of list) {
+          if (snoozed(it)) continue;
           const sisa = sisaHari(dueTs(it));
-          if (sisa <= it.ingatkan) due.push({ it, sisa });
+          const jamHour = it.jamMenit != null ? Math.floor(it.jamMenit / 60) : null;
+          const digestHit = isDigest && sisa <= (it.ingatkan || 3);
+          const jamHit = jamHour === hourNow && sisa === 0; // alarm tepat jam (butuh cron tiap jam)
+          if (digestHit || jamHit) await sendNotifItem(env, uid, it, sisa, jamHit && !isDigest);
         }
-        if (!due.length) continue;
-        due.sort((a, b) => a.sisa - b.sisa);
-        await sendMessage(env, uid, buildNotif(due));
       } catch {
         /* lanjut user berikutnya */
       }
@@ -767,18 +895,21 @@ async function runScheduled(env) {
   } while (cursor);
 }
 
-function buildNotif(due) {
-  const lines = ["🔔 PENGINGAT", ""];
-  for (const { it, sisa } of due) {
-    const j = JENIS[it.jenis] || JENIS.lainnya;
-    const habis = dueTs(it);
-    lines.push(`${statusIcon(sisa, it.ingatkan)} ${j.emoji} ${j.label}${it.nama ? " — " + it.nama : ""}`);
-    lines.push(`   ${j.kata === "isi ulang" ? "Waktunya isi ulang" : "Habis"}: ${namaHariTanggal(habis)}${jamStr(it)} — ${labelSisa(sisa)}`);
-    lines.push(`   👉 ${saran(j, sisa)}`);
-    lines.push("");
-  }
-  lines.push("Sudah beli/perpanjang? Buka /list lalu tap item-nya.");
-  return lines.join("\n");
+// Kirim satu notifikasi per item + tombol (Sudah beli / Snooze).
+async function sendNotifItem(env, uid, it, sisa, precise) {
+  const j = JENIS[it.jenis] || JENIS.lainnya;
+  const habis = dueTs(it);
+  const head = precise ? "⏰ ALARM" : "🔔 PENGINGAT";
+  const text = [
+    `${head}  ${statusIcon(sisa, it.ingatkan)} ${j.emoji} ${j.label}${it.nama ? " — " + it.nama : ""}`,
+    `${j.kata === "isi ulang" ? "Waktunya isi ulang" : "Habis"}: ${namaHariTanggal(habis)}${jamStr(it)} — ${labelSisa(sisa)}`,
+    `👉 ${saran(j, sisa)}`,
+  ].join("\n");
+  const rows = [[
+    { text: "✅ Sudah beli", callback_data: `done:${it.id}` },
+    { text: "😴 Besok", callback_data: `snz:${it.id}` },
+  ]];
+  return sendMessage(env, uid, text, kb(rows));
 }
 
 function saran(j, sisa) {
@@ -845,7 +976,7 @@ const NAMA_BULAN = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Jul
 const NAMA_HARI = ["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
 function wibParts(ts) {
   const d = new Date(ts + WIB_OFFSET_MS);
-  return { y: d.getUTCFullYear(), m: d.getUTCMonth() + 1, d: d.getUTCDate(), dow: d.getUTCDay() };
+  return { y: d.getUTCFullYear(), m: d.getUTCMonth() + 1, d: d.getUTCDate(), dow: d.getUTCDay(), h: d.getUTCHours(), min: d.getUTCMinutes() };
 }
 function namaHariTanggal(ts) {
   const p = wibParts(ts);
@@ -925,15 +1056,22 @@ function helpText() {
     "  • Bulanan tanggal tetap: otomatis lewati ke bulan depan.",
     "",
     "✏️ EDIT: /list → tap item → ✏️ Edit → pilih bagian",
-    "   (nama/nominal, masa aktif/tanggal, tgl beli, jam, H-ingatkan).",
+    "   (nama/nominal, masa aktif/tanggal, tgl beli, jam,",
+    "    H-ingatkan, 🔀 ganti jenis).",
     "",
     "━ NOTIFIKASI ━",
-    "Pengingat otomatis menjelang habis:",
+    "Pengingat otomatis menjelang habis (per item + tombol):",
     "🟢 aman   ⚠️ mepet (≤ H-3)   🔴 habis / telat",
+    "Di notif: ✅ Sudah beli  •  😴 Besok (snooze 1 hari).",
+    "⏰ Alarm tepat jam: set Cron '0 * * * *' (tiap jam) di",
+    "   dashboard — item yg punya jam diingatkan pas jamnya.",
     "",
     "━ PERINTAH ━",
     "/menu — tombol tambah & daftar",
     "/list — lihat semua pengingat + status",
+    "/riwayat — riwayat isi ulang (+ hitungan bulan ini)",
+    "/backup — simpan semua data ke file .json",
+    "/restore — pulihkan data dari file backup",
     "/hari — tanggal sekarang",
   ].join("\n");
 }
@@ -943,6 +1081,9 @@ async function setupMenuButton(env, chatId) {
     { command: "menu", description: "Tambah pengingat / lihat daftar" },
     { command: "list", description: "Daftar pengingat" },
     { command: "tambah", description: "Tambah pengingat" },
+    { command: "riwayat", description: "Riwayat isi ulang" },
+    { command: "backup", description: "Backup data ke file" },
+    { command: "restore", description: "Pulihkan data dari file" },
     { command: "hari", description: "Tanggal sekarang" },
     { command: "help", description: "Bantuan" },
   ];
@@ -1013,4 +1154,11 @@ async function sendMessage(env, chatId, text, extra) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
   });
+}
+
+async function sendDocument(env, chatId, filename, content) {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("document", new Blob([content], { type: "application/json" }), filename);
+  await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendDocument`, { method: "POST", body: form });
 }

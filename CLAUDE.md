@@ -36,10 +36,20 @@ atau teks cepat (`paket 30 15-9 IM3`).
 ## Model data (KV)
 
 - `rem:<uid>` → array pengingat:
-  `{ id, jenis, nama, mulai(ts), durasi(hari), ingatkan(hari) }`
+  `{ id, jenis, nama, ingatkan, [mulai+durasi | hariBulan], [jamMenit], [skipUntil], [snoozeUntil] }`
   - `jenis`: listrik | pulsa | paket | lainnya (lihat konstanta `JENIS`)
-  - habis = `mulai + durasi*DAY`; sisa hari via `sisaHari(habisTs)`
-- `mode:<uid>` → string sementara `add:<jenis>` (TTL 15 mnt).
+  - durasi: habis = `mulai + durasi*DAY`; bulanan: `nextMonthlyTs(hariBulan, skipUntil)`
+  - jatuh tempo via `dueTs(it)`; sisa hari via `sisaHari(dueTs(it))`
+  - `snoozeUntil` (ts): di-snooze sampai tanggal itu (tombol 😴 Besok)
+- `mode:<uid>` → string sementara: `w_*` (wizard), `buy:<id>`, `edit:<id>:<field>`, `restore` (TTL 15 mnt).
+- `ops:<uid>` → operator custom; `labels:<uid>` → label "atas nama" custom.
+- `hist:<uid>` → riwayat isi ulang `{ jenis, label, nama, ts }` (maks 60).
+
+## Cron & notifikasi
+
+- Ringkasan harian dikirim saat jam 08:00 WIB (`isDigest`). Kalau Cron diset
+  `0 * * * *` (tiap jam), item ber-`jamMenit` yang jatuh tempo hari-H juga dapat
+  "⏰ ALARM" tepat di jamnya. Notif per item + tombol (✅ Sudah beli / 😴 Besok).
 
 `uid` = id user Telegram = chat_id (private chat), dipakai langsung untuk notifikasi.
 
