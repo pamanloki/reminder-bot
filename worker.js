@@ -225,7 +225,12 @@ async function handleWizard(env, chatId, uid, data) {
   }
   if (step === "dur") {
     if (val === "type") { await setMode(env, uid, "w_dur"); return sendMessage(env, chatId, "Ketik jumlah hari (mis. 28):", kb([CANCEL_ROW])); }
-    d.schedType = "durasi"; d.durasi = +val; delete d.hariBulan; await saveDraft(env, uid, d); return wStepJam(env, chatId);
+    d.schedType = "durasi"; d.durasi = +val; delete d.hariBulan; delete d.mulai; await saveDraft(env, uid, d); return wStepMulai(env, chatId);
+  }
+  if (step === "when") {
+    if (val === "beli") { await setMode(env, uid, "w_beli"); return sendMessage(env, chatId, "Ketik tanggal beli/isi (mis. 10-9):", kb([CANCEL_ROW])); }
+    if (val === "habis") { await setMode(env, uid, "w_habis"); return sendMessage(env, chatId, "Ketik tanggal habis masa aktif (mis. 8-10):", kb([CANCEL_ROW])); }
+    delete d.mulai; await saveDraft(env, uid, d); return wStepJam(env, chatId); // "today"
   }
   if (step === "tgl") {
     d.schedType = "tanggal"; d.hariBulan = +val; delete d.durasi; await saveDraft(env, uid, d); return wStepJam(env, chatId);
@@ -249,7 +254,17 @@ async function wizardTyped(env, chatId, uid, field, text) {
   if (field === "dur") {
     const n = parseInt(text, 10);
     if (!n || n < 1) return sendMessage(env, chatId, "Angka tidak valid. Ketik jumlah hari (mis. 28):", kb([CANCEL_ROW]));
-    d.schedType = "durasi"; d.durasi = n; delete d.hariBulan; await saveDraft(env, uid, d); return wStepJam(env, chatId);
+    d.schedType = "durasi"; d.durasi = n; delete d.hariBulan; delete d.mulai; await saveDraft(env, uid, d); return wStepMulai(env, chatId);
+  }
+  if (field === "beli") {
+    const ts = parseTanggal(text);
+    if (ts == null) return sendMessage(env, chatId, "Tanggal tidak valid. Contoh: 10-9 (10 September).", kb([CANCEL_ROW]));
+    d.mulai = ts; await saveDraft(env, uid, d); return wStepJam(env, chatId);
+  }
+  if (field === "habis") {
+    const ts = parseTanggal(text);
+    if (ts == null) return sendMessage(env, chatId, "Tanggal tidak valid. Contoh: 8-10 (8 Oktober).", kb([CANCEL_ROW]));
+    d.mulai = ts - (d.durasi || 30) * DAY; await saveDraft(env, uid, d); return wStepJam(env, chatId);
   }
   if (field === "jam") {
     const m = text.match(/(\d{1,2})[:.](\d{2})/);
@@ -298,6 +313,21 @@ function wStepDurasi(env, chatId) {
   rows.push(CANCEL_ROW);
   return sendMessage(env, chatId, "⏳ Masa aktif berapa hari?", kb(rows));
 }
+// Kapan mulainya: baru beli hari ini, atau paket lama yang sudah jalan.
+function wStepMulai(env, chatId) {
+  const rows = [
+    [{ text: "🆕 Baru isi hari ini", callback_data: "w:when:today" }],
+    [{ text: "⏰ Set tgl habis", callback_data: "w:when:habis" }],
+    [{ text: "📅 Set tgl beli", callback_data: "w:when:beli" }],
+    CANCEL_ROW,
+  ];
+  return sendMessage(
+    env,
+    chatId,
+    "📆 Kapan mulainya?\nKalau paket lama yang sudah jalan, set tanggal habisnya biar pas.",
+    kb(rows),
+  );
+}
 function wStepTanggal(env, chatId) {
   const days = [];
   for (let i = 1; i <= 31; i++) days.push({ text: String(i), callback_data: "w:tgl:" + i });
@@ -327,7 +357,9 @@ function wStepConfirm(env, chatId, d) {
   const item = draftToItem(d);
   const j = JENIS[d.jenis] || JENIS.lainnya;
   const due = dueTs(item);
-  const jadwal = item.hariBulan ? `🔁 Tiap tanggal ${item.hariBulan}` : `⏳ ${item.durasi} hari (mulai hari ini)`;
+  const jadwal = item.hariBulan
+    ? `🔁 Tiap tanggal ${item.hariBulan}`
+    : `⏳ ${item.durasi} hari (mulai ${sisaHari(item.mulai) === 0 ? "hari ini" : namaHariTanggal(item.mulai)})`;
   const info = [
     "Cek dulu ya:",
     "",
@@ -347,7 +379,7 @@ function draftToItem(d) {
   if (d.nominal) nama = nama ? nama + " · " + d.nominal : d.nominal;
   const item = { id: Date.now(), jenis: d.jenis, nama, ingatkan: j.ingatkan };
   if (d.schedType === "tanggal") item.hariBulan = d.hariBulan;
-  else { item.mulai = todayTs(); item.durasi = d.durasi || j.durasi; }
+  else { item.mulai = d.mulai != null ? d.mulai : todayTs(); item.durasi = d.durasi || j.durasi; }
   if (d.jamMenit != null) item.jamMenit = d.jamMenit;
   return item;
 }
@@ -428,6 +460,17 @@ function pad(n) {
 function jamStr(it) {
   if (it == null || it.jamMenit == null) return "";
   return ` jam ${pad(Math.floor(it.jamMenit / 60))}:${pad(it.jamMenit % 60)}`;
+}
+
+// Parse "dd-mm[-yyyy]" atau "dd/mm" -> ts tengah hari WIB, atau null.
+function parseTanggal(text) {
+  const dm = String(text || "").match(/\b(\d{1,2})[-/](\d{1,2})(?:[-/](\d{2,4}))?\b/);
+  if (!dm) return null;
+  const d = +dm[1], mo = +dm[2];
+  let y = dm[3] ? +dm[3] : wibParts(Date.now()).y;
+  if (y < 100) y += 2000;
+  if (d < 1 || d > 31 || mo < 1 || mo > 12) return null;
+  return Date.UTC(y, mo - 1, d, 12) - WIB_OFFSET_MS;
 }
 
 // Parse input:
