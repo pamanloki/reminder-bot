@@ -142,12 +142,36 @@ const DUR_PRESET = [7, 15, 28, 30, 60, 90];
 const JAM_PRESET = [
   ["00:00", 0], ["08:00", 480], ["12:00", 720], ["17:00", 1020], ["23:59", 1439],
 ];
-const NOM_PRESET = ["5rb", "10rb", "25rb", "50rb", "100rb"];
+// Preset nominal per jenis (bisa "Lewati" / "Ketik" juga).
+const NOM_PRESET = {
+  listrik: ["20rb", "50rb", "100rb", "200rb", "500rb", "1jt"],
+  pulsa: ["5rb", "10rb", "25rb", "50rb", "100rb"],
+  paket: ["25rb", "50rb", "100rb", "150rb"],
+  lainnya: ["50rb", "100rb", "200rb"],
+};
+function nomPreset(jenis) {
+  return NOM_PRESET[jenis] || NOM_PRESET.lainnya;
+}
 
 function draftKey(uid) { return `draft:${uid}`; }
 async function getDraft(env, uid) { const r = await env.REMINDERS.get(draftKey(uid)); return r ? JSON.parse(r) : null; }
 async function saveDraft(env, uid, d) { await env.REMINDERS.put(draftKey(uid), JSON.stringify(d), { expirationTtl: 1800 }); }
 async function clearDraft(env, uid) { await env.REMINDERS.delete(draftKey(uid)); }
+
+// Operator custom (tersimpan, muncul lagi sebagai tombol).
+async function getCustomOps(env, uid) {
+  const r = await env.REMINDERS.get(`ops:${uid}`);
+  return r ? JSON.parse(r) : [];
+}
+async function addCustomOp(env, uid, name) {
+  name = name.trim().slice(0, 20);
+  if (!name) return;
+  const l = await getCustomOps(env, uid);
+  if (OPERATORS.some((o) => o.toLowerCase() === name.toLowerCase())) return; // sudah ada di default
+  if (l.some((o) => o.toLowerCase() === name.toLowerCase())) return;
+  l.push(name);
+  await env.REMINDERS.put(`ops:${uid}`, JSON.stringify(l.slice(0, 30)));
+}
 
 const CANCEL_ROW = [{ text: "✖️ Batal", callback_data: "menu" }];
 function kb(rows) { return { reply_markup: { inline_keyboard: rows } }; }
@@ -160,7 +184,7 @@ async function handleWizard(env, chatId, uid, data) {
 
   if (step === "jenis") {
     await saveDraft(env, uid, { jenis: val });
-    if (val === "pulsa" || val === "paket") return wStepOperator(env, chatId);
+    if (val === "pulsa" || val === "paket") return wStepOperator(env, chatId, uid);
     return wStepSchedule(env, chatId);
   }
 
@@ -183,7 +207,7 @@ async function handleWizard(env, chatId, uid, data) {
   }
   if (step === "jam") {
     if (val === "type") { await setMode(env, uid, "w_jam"); return sendMessage(env, chatId, "Ketik jam (HH:MM), mis. 14:30:", kb([CANCEL_ROW])); }
-    d.jamMenit = val === "none" ? null : +val; await saveDraft(env, uid, d); return wStepNominal(env, chatId);
+    d.jamMenit = val === "none" ? null : +val; await saveDraft(env, uid, d); return wStepNominal(env, chatId, d.jenis);
   }
   if (step === "nom") {
     if (val === "type") { await setMode(env, uid, "w_nom"); return sendMessage(env, chatId, "Ketik nominal (mis. 50rb):", kb([CANCEL_ROW])); }
@@ -195,7 +219,7 @@ async function handleWizard(env, chatId, uid, data) {
 async function wizardTyped(env, chatId, uid, field, text) {
   const d = await getDraft(env, uid);
   if (!d) return sendMessage(env, chatId, "Sesi kadaluarsa. Mulai lagi dari /menu.", BACK_MENU);
-  if (field === "op") { d.nama = text.trim(); await saveDraft(env, uid, d); return wStepSchedule(env, chatId); }
+  if (field === "op") { const op = text.trim(); d.nama = op; await addCustomOp(env, uid, op); await saveDraft(env, uid, d); return wStepSchedule(env, chatId); }
   if (field === "dur") {
     const n = parseInt(text, 10);
     if (!n || n < 1) return sendMessage(env, chatId, "Angka tidak valid. Ketik jumlah hari (mis. 28):", kb([CANCEL_ROW]));
@@ -204,14 +228,16 @@ async function wizardTyped(env, chatId, uid, field, text) {
   if (field === "jam") {
     const m = text.match(/(\d{1,2})[:.](\d{2})/);
     if (!m || +m[1] > 23 || +m[2] > 59) return sendMessage(env, chatId, "Jam tidak valid. Contoh: 14:30", kb([CANCEL_ROW]));
-    d.jamMenit = +m[1] * 60 + +m[2]; await saveDraft(env, uid, d); return wStepNominal(env, chatId);
+    d.jamMenit = +m[1] * 60 + +m[2]; await saveDraft(env, uid, d); return wStepNominal(env, chatId, d.jenis);
   }
   if (field === "nom") { d.nominal = text.trim(); await saveDraft(env, uid, d); return wStepConfirm(env, chatId, d); }
 }
 
-function wStepOperator(env, chatId) {
-  const rows = chunk(OPERATORS.map((o) => ({ text: o, callback_data: "w:op:" + o })), 2);
-  rows.push([{ text: "✏️ Lainnya (ketik)", callback_data: "w:op:type" }]);
+async function wStepOperator(env, chatId, uid) {
+  const custom = await getCustomOps(env, uid);
+  const all = [...OPERATORS, ...custom.filter((o) => !OPERATORS.includes(o))];
+  const rows = chunk(all.map((o) => ({ text: o, callback_data: "w:op:" + o })), 2);
+  rows.push([{ text: "✏️ Operator lain (ketik)", callback_data: "w:op:type" }]);
   rows.push(CANCEL_ROW);
   return sendMessage(env, chatId, "📱 Pilih operator:", kb(rows));
 }
@@ -245,8 +271,8 @@ function wStepJam(env, chatId) {
   rows.push(CANCEL_ROW);
   return sendMessage(env, chatId, "🕐 Jam habis? (opsional)", kb(rows));
 }
-function wStepNominal(env, chatId) {
-  const rows = chunk(NOM_PRESET.map((n) => ({ text: "Rp" + n, callback_data: "w:nom:" + n })), 3);
+function wStepNominal(env, chatId, jenis) {
+  const rows = chunk(nomPreset(jenis).map((n) => ({ text: "Rp" + n, callback_data: "w:nom:" + n })), 3);
   rows.push([
     { text: "Lewati", callback_data: "w:nom:skip" },
     { text: "✏️ Ketik", callback_data: "w:nom:type" },
