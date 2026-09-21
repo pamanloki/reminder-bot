@@ -185,6 +185,8 @@ async function handleWizard(env, chatId, uid, data) {
   if (step === "jenis") {
     await saveDraft(env, uid, { jenis: val });
     if (val === "pulsa" || val === "paket") return wStepOperator(env, chatId, uid);
+    // Token listrik tak punya "masa aktif" — habisnya karena kepakai. Langsung pilih tanggal bulanan.
+    if (val === "listrik") return wStepTanggal(env, chatId);
     return wStepSchedule(env, chatId);
   }
 
