@@ -36,14 +36,17 @@ atau teks cepat (`paket 30 15-9 IM3`).
 ## Model data (KV)
 
 - `rem:<uid>` → array pengingat:
-  `{ id, jenis, nama, ingatkan, [mulai+durasi | hariBulan], [jamMenit], [skipUntil], [snoozeUntil] }`
+  `{ id, jenis, nama, nominal?, ingatkan, [mulai+durasi | hariBulan | hariMinggu], [jamMenit], [skipUntil], [snoozeUntil] }`
   - `jenis`: listrik | pulsa | paket | lainnya (lihat konstanta `JENIS`)
-  - durasi: habis = `mulai + durasi*DAY`; bulanan: `nextMonthlyTs(hariBulan, skipUntil)`
+  - `nominal`: string harga (mis. "50rb") — dipakai buat rekap pengeluaran
+  - durasi: habis = `mulai + durasi*DAY`; bulanan: `nextMonthlyTs(hariBulan, skipUntil)`;
+    mingguan: `nextWeeklyTs(hariMinggu 0-6, skipUntil)`
   - jatuh tempo via `dueTs(it)`; sisa hari via `sisaHari(dueTs(it))`
   - `snoozeUntil` (ts): di-snooze sampai tanggal itu (tombol 😴 Besok)
 - `mode:<uid>` → string sementara: `w_*` (wizard), `buy:<id>`, `edit:<id>:<field>`, `restore` (TTL 15 mnt).
 - `ops:<uid>` → operator custom; `labels:<uid>` → label "atas nama" custom.
-- `hist:<uid>` → riwayat isi ulang `{ jenis, label, nama, ts }` (maks 60).
+- `hist:<uid>` → riwayat isi ulang `{ jenis, label, nama, nominal, ts }` (maks 60).
+  `/riwayat` menjumlah `nominal` per jenis (bulan ini); `/tren` bar 6 bulan.
 
 ## Cron & notifikasi
 

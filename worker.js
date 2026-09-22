@@ -93,6 +93,7 @@ async function routeMessage(env, chatId, msg) {
   if (lower.startsWith("/list") || lower.startsWith("/daftar")) return sendList(env, chatId, uid);
   if (lower.startsWith("/hari") || lower.startsWith("/tanggal")) return sendMessage(env, chatId, `📆 Sekarang: ${namaHariTanggal(Date.now())} (WIB)`);
   if (lower.startsWith("/riwayat") || lower.startsWith("/history")) return sendRiwayat(env, chatId, uid);
+  if (lower.startsWith("/tren") || lower.startsWith("/grafik")) return sendTren(env, chatId, uid);
   if (lower.startsWith("/backup") || lower.startsWith("/export")) return sendBackup(env, chatId, uid);
   if (lower.startsWith("/restore") || lower.startsWith("/import")) {
     await setMode(env, uid, "restore");
@@ -145,6 +146,8 @@ async function handleCallback(env, cq) {
     if (data === "menu") { await clearDraft(env, uid); return sendMenu(env, chatId, uid); }
     if (data === "dash") return sendDashboard(env, chatId, uid);
     if (data === "list") return sendList(env, chatId, uid);
+    if (data === "riwayat") return sendRiwayat(env, chatId, uid);
+    if (data === "tren") return sendTren(env, chatId, uid);
     if (data === "help") return sendMessage(env, chatId, helpText(), BACK_MENU);
     if (data === "hari") return sendMessage(env, chatId, `📆 Sekarang: ${namaHariTanggal(Date.now())} (WIB)`, BACK_MENU);
     if (data[0] === "w") return handleWizard(env, chatId, uid, data);
@@ -249,7 +252,13 @@ async function handleWizard(env, chatId, uid, data) {
     return wSetPemilik(env, chatId, uid, d, val === "skip" ? "" : val);
   }
   if (step === "sched") {
-    return val === "tanggal" ? wStepTanggal(env, chatId) : wStepDurasi(env, chatId);
+    if (val === "tanggal") return wStepTanggal(env, chatId);
+    if (val === "mingguan") return wStepMinggu(env, chatId);
+    return wStepDurasi(env, chatId);
+  }
+  if (step === "dow") {
+    d.schedType = "mingguan"; d.hariMinggu = +val; delete d.durasi; delete d.hariBulan; delete d.mulai;
+    await saveDraft(env, uid, d); return wStepJam(env, chatId);
   }
   if (step === "dur") {
     if (val === "type") { await setMode(env, uid, "w_dur"); return sendMessage(env, chatId, "Ketik jumlah hari (mis. 28):", kb([CANCEL_ROW])); }
@@ -338,9 +347,15 @@ function wStepSchedule(env, chatId) {
   const rows = [
     [{ text: "⏳ Masa aktif (hari)", callback_data: "w:sched:durasi" }],
     [{ text: "🔁 Tiap tanggal (bulanan)", callback_data: "w:sched:tanggal" }],
+    [{ text: "📅 Tiap minggu (hari)", callback_data: "w:sched:mingguan" }],
     CANCEL_ROW,
   ];
   return sendMessage(env, chatId, "Pilih cara pengingat:", kb(rows));
+}
+function wStepMinggu(env, chatId) {
+  const rows = chunk(HARI.map((h, i) => ({ text: h, callback_data: "w:dow:" + i })), 4);
+  rows.push(CANCEL_ROW);
+  return sendMessage(env, chatId, "📅 Tiap hari apa?", kb(rows));
 }
 function wStepDurasi(env, chatId) {
   const rows = chunk(DUR_PRESET.map((n) => ({ text: n + " hari", callback_data: "w:dur:" + n })), 3);
@@ -395,7 +410,9 @@ function wStepConfirm(env, chatId, d) {
   const due = dueTs(item);
   const jadwal = item.hariBulan
     ? `🔁 Tiap tanggal ${item.hariBulan}`
-    : `⏳ ${item.durasi} hari (mulai ${sisaHari(item.mulai) === 0 ? "hari ini" : namaHariTanggal(item.mulai)})`;
+    : item.hariMinggu != null
+      ? `📅 Tiap hari ${HARI[item.hariMinggu]}`
+      : `⏳ ${item.durasi} hari (mulai ${sisaHari(item.mulai) === 0 ? "hari ini" : namaHariTanggal(item.mulai)})`;
   const info = [
     "Cek dulu ya:",
     "",
@@ -414,7 +431,9 @@ function draftToItem(d) {
   let nama = d.nama || "";
   if (d.nominal) nama = nama ? nama + " · " + d.nominal : d.nominal;
   const item = { id: Date.now(), jenis: d.jenis, nama, ingatkan: j.ingatkan };
+  if (d.nominal) item.nominal = d.nominal; // simpan angka biar bisa direkap
   if (d.schedType === "tanggal") item.hariBulan = d.hariBulan;
+  else if (d.schedType === "mingguan") item.hariMinggu = d.hariMinggu;
   else { item.mulai = d.mulai != null ? d.mulai : todayTs(); item.durasi = d.durasi || j.durasi; }
   if (d.jamMenit != null) item.jamMenit = d.jamMenit;
   return item;
@@ -453,6 +472,8 @@ async function addReminder(env, chatId, uid, jenis, argStr) {
   };
   if (p.hariBulan) {
     item.hariBulan = p.hariBulan; // pengingat bulanan tanggal tetap
+  } else if (p.hariMinggu != null) {
+    item.hariMinggu = p.hariMinggu; // pengingat mingguan
   } else {
     item.mulai = p.mulai;
     item.durasi = p.durasi;
@@ -466,7 +487,9 @@ async function addReminder(env, chatId, uid, jenis, argStr) {
   const sisa = sisaHari(due);
   const barisJadwal = item.hariBulan
     ? `🔁 Tiap tanggal ${item.hariBulan} tiap bulan`
-    : `📅 Mulai: ${namaHariTanggal(item.mulai)}\n⏳ ${j.kata}: ${item.durasi} hari`;
+    : item.hariMinggu != null
+      ? `📅 Tiap hari ${HARI[item.hariMinggu]}`
+      : `📅 Mulai: ${namaHariTanggal(item.mulai)}\n⏳ ${j.kata}: ${item.durasi} hari`;
   return sendMessage(
     env,
     chatId,
@@ -484,7 +507,9 @@ async function addReminder(env, chatId, uid, jenis, argStr) {
 
 // Jatuh tempo/hari-H sebuah pengingat (dukung bulanan tetap, durasi, & jam).
 function dueTs(it) {
-  const base = it.hariBulan ? nextMonthlyTs(it.hariBulan, it.skipUntil) : it.mulai + it.durasi * DAY;
+  const base = it.hariBulan ? nextMonthlyTs(it.hariBulan, it.skipUntil)
+    : it.hariMinggu != null ? nextWeeklyTs(it.hariMinggu, it.skipUntil)
+      : it.mulai + it.durasi * DAY;
   if (it.jamMenit == null) return base;
   const p = wibParts(base);
   return Date.UTC(p.y, p.m - 1, p.d, Math.floor(it.jamMenit / 60), it.jamMenit % 60) - WIB_OFFSET_MS;
@@ -523,6 +548,17 @@ function parseAdd(s, j) {
     if (hh < 24 && mm < 60) {
       jamMenit = hh * 60 + mm;
       s = (s.slice(0, jm.index) + s.slice(jm.index + jm[0].length)).replace(/\s+/g, " ").trim();
+    }
+  }
+
+  // Mingguan: "tiap senin", "setiap jumat"
+  const wk = s.match(/\b(?:tiap|setiap)\s*(minggu|senin|selasa|rabu|kamis|jumat|jum'at|sabtu)\b/i);
+  if (wk) {
+    let d = wk[1].toLowerCase().replace("jum'at", "jumat");
+    const dow = HARI.findIndex((h) => h.toLowerCase() === d);
+    if (dow >= 0) {
+      const nama = (s.slice(0, wk.index) + s.slice(wk.index + wk[0].length)).replace(/\s+/g, " ").trim();
+      return { hariMinggu: dow, nama, jamMenit };
     }
   }
 
@@ -628,15 +664,17 @@ async function sendItem(env, chatId, uid, id) {
   const sisa = sisaHari(due);
   const jadwal = it.hariBulan
     ? `🔁 Tiap tanggal ${it.hariBulan} tiap bulan`
-    : `📅 Mulai: ${namaHariTanggal(it.mulai)}\n⏳ ${j.kata}: ${it.durasi} hari`;
+    : it.hariMinggu != null
+      ? `📅 Tiap hari ${HARI[it.hariMinggu]}`
+      : `📅 Mulai: ${namaHariTanggal(it.mulai)}\n⏳ ${j.kata}: ${it.durasi} hari`;
   const info = [
     `${j.emoji} ${j.label}${it.nama ? " — " + it.nama : ""}`,
     jadwal,
     `🔔 Berikutnya: ${namaHariTanggal(due)}${jamStr(it)} (${labelSisa(sisa)})`,
   ].join("\n");
-  const btnBaris = it.hariBulan
+  const btnBaris = (it.hariBulan || it.hariMinggu != null)
     ? [
-        { text: "✅ Sudah beli bulan ini", callback_data: `done:${it.id}` },
+        { text: "✅ Sudah / selesai", callback_data: `done:${it.id}` },
         { text: "🗑️ Hapus", callback_data: `del:${it.id}` },
       ]
     : [
@@ -766,7 +804,8 @@ async function logRiwayat(env, uid, it, ts) {
     const raw = await env.REMINDERS.get(`hist:${uid}`);
     const arr = raw ? JSON.parse(raw) : [];
     const j = JENIS[it.jenis] || JENIS.lainnya;
-    arr.unshift({ jenis: it.jenis, label: j.label, nama: it.nama || "", ts: ts || Date.now() });
+    const nominal = parseRupiah(it.nominal || it.nama);
+    arr.unshift({ jenis: it.jenis, label: j.label, nama: it.nama || "", nominal, ts: ts || Date.now() });
     await env.REMINDERS.put(`hist:${uid}`, JSON.stringify(arr.slice(0, 60)));
   } catch { /* abaikan */ }
 }
@@ -777,11 +816,58 @@ async function sendRiwayat(env, chatId, uid) {
   if (!arr.length) return sendMessage(env, chatId, "📜 Belum ada riwayat. Tekan ✅ Sudah beli saat mengisi ulang, nanti tercatat di sini.", BACK_MENU);
   const now = wibParts(Date.now());
   const bulanIni = arr.filter((r) => { const p = wibParts(r.ts); return p.y === now.y && p.m === now.m; });
+  // Rekap pengeluaran bulan ini per jenis (dari nominal).
+  const perJenis = {}; let totalBulan = 0;
+  for (const r of bulanIni) {
+    const n = r.nominal || parseRupiah(r.nama);
+    if (!n) continue;
+    perJenis[r.jenis] = (perJenis[r.jenis] || 0) + n;
+    totalBulan += n;
+  }
   const lines = [`📜 Riwayat isi ulang (${bulanIni.length}x bulan ini)`, ""];
+  if (totalBulan > 0) {
+    lines.push(`💰 Pengeluaran bulan ini: ${fmtRp(totalBulan)}`);
+    for (const jk of Object.keys(perJenis)) {
+      const j = JENIS[jk] || JENIS.lainnya;
+      lines.push(`   ${j.emoji} ${j.label}: ${fmtRp(perJenis[jk])}`);
+    }
+    lines.push("");
+  }
   for (const r of arr.slice(0, 20)) {
     const j = JENIS[r.jenis] || JENIS.lainnya;
-    lines.push(`${j.emoji} ${r.label}${r.nama ? " — " + r.nama : ""}\n   ${namaHariTanggal(r.ts)}`);
+    const n = r.nominal || parseRupiah(r.nama);
+    lines.push(`${j.emoji} ${r.label}${r.nama ? " — " + r.nama : ""}${n ? " · " + fmtRp(n) : ""}\n   ${namaHariTanggal(r.ts)}`);
   }
+  return sendMessage(env, chatId, lines.join("\n"), BACK_MENU);
+}
+
+// Tren pengeluaran 6 bulan terakhir (bar teks) dari riwayat + nominal.
+const BULAN_SINGKAT = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
+async function sendTren(env, chatId, uid) {
+  const raw = await env.REMINDERS.get(`hist:${uid}`);
+  const arr = raw ? JSON.parse(raw) : [];
+  if (!arr.length) return sendMessage(env, chatId, "📊 Belum ada data pengeluaran. Tekan ✅ Sudah beli (dengan nominal) saat isi ulang, nanti kerekap.", BACK_MENU);
+  const now = wibParts(Date.now());
+  const buckets = [];
+  for (let i = 5; i >= 0; i--) {
+    let y = now.y, m = now.m - i;
+    while (m < 1) { m += 12; y--; }
+    buckets.push({ y, m, total: 0 });
+  }
+  for (const r of arr) {
+    const p = wibParts(r.ts);
+    const b = buckets.find((x) => x.y === p.y && x.m === p.m);
+    if (b) b.total += r.nominal || parseRupiah(r.nama);
+  }
+  const max = Math.max(1, ...buckets.map((b) => b.total));
+  const lines = ["📊 Tren pengeluaran 6 bulan", ""];
+  for (const b of buckets) {
+    const n = Math.round((b.total / max) * 10);
+    const bar = "█".repeat(n) + "░".repeat(10 - n);
+    lines.push(`${BULAN_SINGKAT[b.m - 1]} '${String(b.y).slice(2)} ${bar} ${fmtRp(b.total)}`);
+  }
+  const totalAll = buckets.reduce((s, b) => s + b.total, 0);
+  lines.push("", `Rata-rata/bulan: ${fmtRp(totalAll / buckets.length)}`);
   return sendMessage(env, chatId, lines.join("\n"), BACK_MENU);
 }
 
@@ -838,8 +924,8 @@ async function sudahBeli(env, chatId, uid, id) {
   const it = list.find((x) => x.id === id);
   if (!it) return sendMessage(env, chatId, "Pengingat tidak ditemukan.", BACK_MENU);
   const j = JENIS[it.jenis] || JENIS.lainnya;
-  if (it.hariBulan) {
-    // Lewati tanggal terdekat -> pengingat lompat ke bulan berikutnya.
+  if (it.hariBulan || it.hariMinggu != null) {
+    // Lewati jadwal terdekat -> pengingat lompat ke siklus berikutnya.
     it.skipUntil = dueTs(it);
     delete it.snoozeUntil;
     await saveItems(env, uid, list);
@@ -848,7 +934,7 @@ async function sudahBeli(env, chatId, uid, id) {
     return sendMessage(
       env,
       chatId,
-      `👍 Oke, tanggal ${it.hariBulan} bulan ini aku lewati.\n🔔 Pengingat berikutnya: ${namaHariTanggal(next)}${jamStr(it)}.`,
+      `👍 Oke, dicatat.\n🔔 Pengingat berikutnya: ${namaHariTanggal(next)}${jamStr(it)}.`,
       BACK_MENU,
     );
   }
@@ -1006,6 +1092,31 @@ function sisaHari(habisTs) {
   const td = Date.UTC(t.y, t.m - 1, t.d);
   return Math.round((hd - td) / DAY);
 }
+// Nama hari (0 = Minggu).
+const HARI = ["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
+// Tanggal berikutnya dengan hari-minggu = dow (0-6), pada/sesudah hari ini (WIB).
+// `after`: lewati sampai hari itu (dipakai saat "sudah") -> lompat ke minggu depan.
+function nextWeeklyTs(dow, after) {
+  const t = wibParts(Date.now());
+  let refUTC = Date.UTC(t.y, t.m - 1, t.d);
+  if (after) { const a = wibParts(after); const aNext = Date.UTC(a.y, a.m - 1, a.d) + DAY; if (aNext > refUTC) refUTC = aNext; }
+  const refDow = new Date(refUTC).getUTCDay();
+  const add = (dow - refDow + 7) % 7;
+  const target = new Date(refUTC + add * DAY);
+  return Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), target.getUTCDate(), 12) - WIB_OFFSET_MS;
+}
+// Ambil nominal (rupiah) dari string bebas: "50rb" -> 50000, "1,5jt" -> 1500000, "100k".
+function parseRupiah(s) {
+  const m = String(s || "").match(/(\d[\d.,]*)\s*(jt|juta|rb|ribu|k)?/i);
+  if (!m) return 0;
+  let n = parseFloat(m[1].replace(/\.(?=\d{3}\b)/g, "").replace(",", "."));
+  if (!isFinite(n)) return 0;
+  const u = (m[2] || "").toLowerCase();
+  if (/^(jt|juta)$/.test(u)) n *= 1e6;
+  else if (/^(rb|ribu|k)$/.test(u)) n *= 1e3;
+  return Math.round(n);
+}
+function fmtRp(n) { return "Rp" + Math.round(n || 0).toLocaleString("id-ID"); }
 function labelSisa(sisa) {
   if (sisa < 0) return `telat ${-sisa} hari`;
   if (sisa === 0) return "HARI INI";
@@ -1052,6 +1163,10 @@ const MENU_MAIN = {
         { text: "📋 Daftar", callback_data: "list" },
       ],
       [
+        { text: "📜 Riwayat", callback_data: "riwayat" },
+        { text: "📈 Tren", callback_data: "tren" },
+      ],
+      [
         { text: "📆 Hari ini", callback_data: "hari" },
         { text: "❓ Bantuan", callback_data: "help" },
       ],
@@ -1095,6 +1210,7 @@ function helpText() {
     "━ CARA TAMBAH CEPAT (ketik) ━",
     "1) Bulanan tanggal tetap:",
     "   <jenis> tiap <tgl> [nama]  • paket tiap 1",
+    "   Mingguan: <jenis> tiap <hari>  • lainnya tiap senin bayar kos",
     "2) Masa aktif (N hari):",
     "   <jenis> <hari> [tgl] [nama]",
     "   • paket 30 15-9 IM3  → 30 hari, beli 15/9, nama IM3",
@@ -1125,7 +1241,8 @@ function helpText() {
     "/menu — tombol tambah & daftar",
     "/dashboard — ringkasan sekilas (perlu aksi / mepet / aman)",
     "/list — lihat semua pengingat + status",
-    "/riwayat — riwayat isi ulang (+ hitungan bulan ini)",
+    "/riwayat — riwayat isi ulang (+ total pengeluaran bulan ini)",
+    "/tren — grafik pengeluaran 6 bulan",
     "/backup — simpan semua data ke file .json",
     "/restore — pulihkan data dari file backup",
     "/hari — tanggal sekarang",
